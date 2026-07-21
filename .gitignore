@@ -1,0 +1,7 @@
+/target
+fixtures/*.CR3
+fixtures/*.CR2
+fixtures/*.JPG
+fixtures/*.HIF
+fixtures/*.jpg
+*.db

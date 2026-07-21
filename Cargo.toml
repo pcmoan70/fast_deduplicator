@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/fd-core", "crates/fd-cli"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+rayon = "1.10"
+crossbeam-channel = "0.5"
+zune-jpeg = "0.4"
+memchr = "2"
+clap = { version = "4", features = ["derive"] }
+jwalk = "0.8"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"

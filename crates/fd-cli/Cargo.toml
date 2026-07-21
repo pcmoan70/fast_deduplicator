@@ -1,0 +1,16 @@
+[package]
+name = "fd-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fd"
+path = "src/main.rs"
+
+[dependencies]
+fd-core = { path = "../fd-core" }
+anyhow.workspace = true
+rayon.workspace = true
+clap.workspace = true
+jwalk.workspace = true
