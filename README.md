@@ -5,7 +5,8 @@ files in seconds, groups burst sequences, ranks frames by sharpness at a
 point you click once (e.g. a bird's eye, tracked through the burst), and
 harvests the keepers: XMP ratings, copy picks, trash rejects.
 
-*Updated: 2026-07-21 — status: M0 (format core + CLI) done.*
+*Updated: 2026-07-21 — status: M0+M1 done (format core, burst grouping,
+sharpness ranking, score cache, XMP/copy harvest via CLI).*
 
 ## Why it's fast
 
@@ -27,7 +28,17 @@ fd scan /path/to/card            # metadata table + timing summary
 fd scan DIR --all                # one row per file
 fd scan DIR --dump-previews OUT  # extract 1620px embedded previews
 fd scan DIR --dump-fullsize OUT  # extract full-res embedded JPEGs
+
+fd cull DIR --dry-run            # group bursts, rank by sharpness, list picks
+fd cull DIR --top 2 --xmp        # write XMP sidecars (rating 3) for top 2/burst
+fd cull DIR --copy-to KEEPERS    # copy picks (+sidecars) to a folder
+fd bench FILE                    # per-stage timings for one file
 ```
+
+Measured on the reference card (5,540 files): cold cull 13.6 s, re-cull
+with warm cache 0.17 s. RAW+JPEG pairs are treated as one image. Canon
+JPGs are scored from their embedded 1620px MPF preview (~300 KB read
+instead of a 45 MP decode).
 
 ## Building
 

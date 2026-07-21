@@ -4,6 +4,17 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+default = ["turbo"]
+# DCT-domain scaled decode (1/2..1/8) via libjpeg-turbo; C code, excluded
+# from any future wasm build. Pure-Rust zune-jpeg remains the fallback.
+turbo = ["dep:turbojpeg"]
+
 [dependencies]
 thiserror.workspace = true
 memchr.workspace = true
+zune-jpeg.workspace = true
+zune-core = "0.4"
+rusqlite = { version = "0.37", features = ["bundled"] }
+xxhash-rust.workspace = true
+turbojpeg = { version = "1", optional = true }

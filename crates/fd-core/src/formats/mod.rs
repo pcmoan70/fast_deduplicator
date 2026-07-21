@@ -38,6 +38,8 @@ pub fn parse_header(path: &Path) -> Result<(FileMeta, u64), ParseError> {
     let size = r.len();
     let mut meta = FileMeta::new(path.to_path_buf(), size, kind);
     let header = r.header().to_vec();
+    meta.content_key =
+        xxhash_rust::xxh3::xxh3_64(&header[..header.len().min(64 * 1024)]);
     match kind {
         FileKind::Cr3 => cr3::parse(&mut r, &header, &mut meta)?,
         FileKind::Cr2 => {

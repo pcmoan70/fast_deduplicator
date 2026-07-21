@@ -98,6 +98,8 @@ pub struct FileMeta {
     pub height: u32,
     /// Camera file number from the filename digits (e.g. 4P4A9770 -> 9770).
     pub file_number: Option<u32>,
+    /// xxh3 of the first 64 KB; cache key component.
+    pub content_key: u64,
     pub thumb: Option<PreviewInfo>,
     pub preview: Option<PreviewInfo>,
     pub fullsize: Option<PreviewInfo>,
@@ -135,6 +137,7 @@ impl FileMeta {
             width: 0,
             height: 0,
             file_number,
+            content_key: 0,
             thumb: None,
             preview: None,
             fullsize: None,

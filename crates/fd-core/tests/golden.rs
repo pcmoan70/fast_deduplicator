@@ -80,7 +80,12 @@ fn jpeg_r5m2_golden() {
     assert_eq!(m.ts.unwrap().unix_centis, 1746285170_00);
     assert_eq!(m.exposure.iso, Some(1000));
     assert_eq!((m.width, m.height), (8192, 5464));
-    assert_eq!(m.preview.unwrap().range.len, m.size);
+    // Canon JPGs carry an MPF preview appendix; must beat whole-file decode
+    let pv = m.preview.unwrap();
+    assert!(pv.range.len < 1_000_000, "MPF preview not found");
+    let (jpeg, _, _) = formats::extract_preview(&m).unwrap().unwrap();
+    assert_eq!(&jpeg[0..2], &[0xFF, 0xD8]);
+    assert_eq!(m.fullsize.unwrap().range.len, m.size);
 }
 
 #[test]

@@ -15,12 +15,18 @@ Test corpus: /home/pc/temp/EOSR5_20251014/100EOSR5/ (5,575 files, 103 GB, R5 CR3
 - [x] Golden tests on fixtures (R5 II CR3+JPG, 5D3 CR2); EXIF cross-checked vs PIL
 - [x] Verify: 6,647 files/s on 5,540-file card dump (target was ≥200); previews valid 1620×1080, fullsize 8192×5464
 
-## M1 — Grouping + scoring + cache + XMP
-- [ ] Burst grouping (camera serial, ts+subsec, file number, gap threshold)
-- [ ] Sharpness: Tenengrad + Laplacian, multi-scale, contrast-normalized
-- [ ] SQLite cache (files/thumbs/scores/bursts/decisions), single writer
-- [ ] XMP sidecar writer (Lightroom-compatible)
-- [ ] fd-cli cull --auto (top-N per burst)
+## M1 — Grouping + scoring + cache + XMP  ✅ 2026-07-21
+- [x] RAW+JPEG pairing (logical images) + burst grouping (serial, ts+subsec, gap)
+- [x] Sharpness: contrast-normalized Tenengrad, single-scale (multi-scale rejected — see lessons), max-over-tiles global with center bias
+- [x] MPF preview discovery in Canon JPGs (1620px appendix; 40x I/O cut for JPEG bursts)
+- [x] turbojpeg `turbo` feature (SIMD, DCT-scaled decode) with zune-jpeg fallback; nasm built to ~/.local
+- [x] SQLite score cache keyed by (xxh3-64KB, size)
+- [x] XMP sidecar writer + copy-picks harvest
+- [x] fd cull: top-N per burst, --xmp/--copy-to/--dry-run; fd bench per-stage
+- [x] Verify: 5,540-file card cold cull 13.6 s; warm re-cull 0.17 s (target <1.5 s/1000 ✓); 595 bursts, 1,124 picks; sidecars valid (LR read-check pending user)
+
+## Test data safety (user instruction 2026-07-21)
+- [x] Corpus copied to /home/pc/fd_testdata/100EOSR5 — ALL tool runs use the copy, originals in /home/pc/temp are off-limits
 
 ## M2 — GUI browse + harvest (eframe/wgpu)
 ## M3 — Click-ROI + NCC tracking + ROI ranking
