@@ -5,8 +5,22 @@ files in seconds, groups burst sequences, ranks frames by sharpness at a
 point you click once (e.g. a bird's eye, tracked through the burst), and
 harvests the keepers: XMP ratings, copy picks, trash rejects.
 
-*Updated: 2026-07-21 — status: M0+M1 done (format core, burst grouping,
-sharpness ranking, score cache, XMP/copy harvest via CLI).*
+*Updated: 2026-07-22 — status: M0+M1 done; M2 GUI first cut done
+(browse/cull/harvest); next: ROI click-and-track (M3).*
+
+## GUI
+
+```bash
+fd-gui /path/to/card
+```
+
+Card Overview shows every burst as a stack (green ring = culled). Enter
+opens a burst: filmstrip with sharpness badges, arrows navigate, `P`/`X`
+pick/reject with auto-advance, `1–5` stars, `Ctrl+Enter` accepts the top-2
+and rejects the rest, `N` jumps to the next unculled burst, `Z` toggles
+100% zoom (preview first, full-res swaps in). `Ctrl+H` opens Harvest
+(XMP sidecars + copy picks). `?` shows all keys. Flags autosave to a
+session file; reopening the folder resumes where you left off.
 
 ## Why it's fast
 

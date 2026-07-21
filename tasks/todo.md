@@ -28,7 +28,16 @@ Test corpus: /home/pc/temp/EOSR5_20251014/100EOSR5/ (5,575 files, 103 GB, R5 CR3
 ## Test data safety (user instruction 2026-07-21)
 - [x] Corpus copied to /home/pc/fd_testdata/100EOSR5 — ALL tool runs use the copy, originals in /home/pc/temp are off-limits
 
-## M2 — GUI browse + harvest (eframe/wgpu)
+## M2 — GUI browse + harvest  ✅ first cut 2026-07-22
+- [x] fd-core::pipeline Engine: scan thread + worker pool + priority job queue (Full>Preview>Thumb>Score), cache-backed scoring
+- [x] fd-gui (eframe 0.31/glow): Card Overview grid (virtualized, burst stacks, cull rings), Burst View (main image + filmstrip with score/flag badges), zoom fit/100% with progressive PREVIEW→FULL, pan
+- [x] Keyboard: arrows/Enter/Esc/N · P/X/U/1-5/0 · Ctrl+Enter accept top-2 · Ctrl+X reject burst · O sort · Ctrl+Z undo · Ctrl+H harvest · ? help
+- [x] Texture LRU budgets (1500 thumbs / 8 previews / 2 fulls)
+- [x] Harvest dialog: XMP + copy picks (background thread, progress)
+- [x] Session persistence (.fd-session.tsv, debounced autosave)
+- [x] --screenshot self-test mode; verified overview/burst/full-card renders on real corpus (595 stacks streaming)
+- [ ] User acceptance pass (interactive feel, keyboard flow) — needs eyes on screen
+- Note: DPMS-off suppresses repaints (found during headless testing) — irrelevant in real use
 ## M3 — Click-ROI + NCC tracking + ROI ranking
 ## M4 — HEIF, DPRAW, trash-rejects, packaging
 ## M5 — (stretch) web build

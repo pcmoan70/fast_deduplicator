@@ -13,6 +13,7 @@ turbo = ["dep:turbojpeg"]
 [dependencies]
 thiserror.workspace = true
 memchr.workspace = true
+crossbeam-channel.workspace = true
 zune-jpeg.workspace = true
 zune-core = "0.4"
 rusqlite = { version = "0.37", features = ["bundled"] }

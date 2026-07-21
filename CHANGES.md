@@ -1,5 +1,22 @@
 # Changes
 
+## 2026-07-22 — M2 (first cut): GUI
+- New `fd-gui` binary (egui/eframe): Card Overview of burst stacks
+  (virtualized grid, cull-state rings, pick tallies), Burst View with main
+  image + filmstrip (sharpness badges, flag colors), fit/100% zoom with
+  progressive PREVIEW→FULL swap and drag pan.
+- Keyboard-first culling: arrows/Enter/Esc, N next unculled burst, P/X/U
+  flags with auto-advance, 1–5/0 stars, Ctrl+Enter accept top-2 + reject
+  rest, Ctrl+X reject burst, O sort time/sharpness, Ctrl+Z undo, ? help.
+- Engine in fd-core: scan thread + decode worker pool with priority queue
+  (visible frame > neighbors > thumbs > background scoring), SQLite-backed
+  score cache shared with the CLI, texture LRU budgets.
+- Harvest dialog (Ctrl+H): XMP sidecars + copy picks with live progress.
+- Session persistence: flags/ratings autosaved to .fd-session.tsv; resume
+  on reopen.
+- `--screenshot`/`--open-burst` self-test flags; verified rendering against
+  the full 5,540-file corpus copy.
+
 ## 2026-07-21 — M1: burst grouping, sharpness ranking, cache, harvest
 - RAW+JPEG pairing into logical images; burst grouping by camera serial +
   subsecond timestamp gap (default 0.6 s, `--gap`).

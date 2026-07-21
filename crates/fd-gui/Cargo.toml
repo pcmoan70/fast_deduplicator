@@ -1,0 +1,14 @@
+[package]
+name = "fd-gui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fd-gui"
+path = "src/main.rs"
+
+[dependencies]
+fd-core = { path = "../fd-core" }
+eframe = { version = "0.31", default-features = false, features = ["glow", "wayland", "x11"] }
+image = { version = "0.25", default-features = false, features = ["png"] }

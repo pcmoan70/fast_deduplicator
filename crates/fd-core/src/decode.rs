@@ -70,3 +70,57 @@ pub fn decode_luma_scaled(jpeg: &[u8], min_long_edge: usize) -> Result<Luma, Dec
 pub fn decode_luma_scaled(jpeg: &[u8], _min_long_edge: usize) -> Result<Luma, DecodeError> {
     decode_luma(jpeg)
 }
+
+pub struct Rgba {
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+}
+
+/// RGBA decode at the smallest DCT scale keeping the long edge >=
+/// `min_long_edge` (see decode_luma_scaled). Used for display textures.
+#[cfg(feature = "turbo")]
+pub fn decode_rgba_scaled(jpeg: &[u8], min_long_edge: usize) -> Result<Rgba, DecodeError> {
+    let mut d = turbojpeg::Decompressor::new().map_err(|e| DecodeError(e.to_string()))?;
+    let hdr = d.read_header(jpeg).map_err(|e| DecodeError(e.to_string()))?;
+    let long = hdr.width.max(hdr.height);
+    let mut chosen = turbojpeg::ScalingFactor::ONE;
+    for denom in [8usize, 4, 2] {
+        if long / denom >= min_long_edge {
+            chosen = turbojpeg::ScalingFactor::new(1, denom);
+            break;
+        }
+    }
+    d.set_scaling_factor(chosen)
+        .map_err(|e| DecodeError(e.to_string()))?;
+    let (width, height) = (chosen.scale(hdr.width), chosen.scale(hdr.height));
+    let mut image = turbojpeg::Image {
+        pixels: vec![0u8; width * height * 4],
+        width,
+        pitch: width * 4,
+        height,
+        format: turbojpeg::PixelFormat::RGBA,
+    };
+    d.decompress(jpeg, image.as_deref_mut())
+        .map_err(|e| DecodeError(e.to_string()))?;
+    Ok(Rgba {
+        pixels: image.pixels,
+        width,
+        height,
+    })
+}
+
+#[cfg(not(feature = "turbo"))]
+pub fn decode_rgba_scaled(jpeg: &[u8], _min_long_edge: usize) -> Result<Rgba, DecodeError> {
+    let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
+    let mut dec = JpegDecoder::new_with_options(jpeg, opts);
+    let pixels = dec.decode().map_err(|e| DecodeError(e.to_string()))?;
+    let (width, height) = dec
+        .dimensions()
+        .ok_or_else(|| DecodeError("no dimensions".into()))?;
+    Ok(Rgba {
+        pixels,
+        width: width as usize,
+        height: height as usize,
+    })
+}

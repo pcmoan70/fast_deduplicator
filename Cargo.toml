@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fd-core", "crates/fd-cli"]
+members = ["crates/fd-core", "crates/fd-cli", "crates/fd-gui"]
 
 [workspace.package]
 edition = "2021"
