@@ -8,6 +8,7 @@ fn main() -> eframe::Result {
     let mut screenshot: Option<PathBuf> = None;
     let mut shot_frames = 30u64;
     let mut open_burst: Option<usize> = None;
+    let mut auto_track: Option<(f32, f32)> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--screenshot" => screenshot = args.next().map(PathBuf::from),
@@ -15,6 +16,12 @@ fn main() -> eframe::Result {
                 shot_frames = args.next().and_then(|v| v.parse().ok()).unwrap_or(30)
             }
             "--open-burst" => open_burst = args.next().and_then(|v| v.parse().ok()),
+            "--auto-track" => {
+                auto_track = args.next().and_then(|v| {
+                    let (x, y) = v.split_once(',')?;
+                    Some((x.parse().ok()?, y.parse().ok()?))
+                })
+            }
             _ => dir = Some(PathBuf::from(a)),
         }
     }
@@ -39,6 +46,7 @@ fn main() -> eframe::Result {
                 screenshot,
                 shot_frames,
                 open_burst,
+                auto_track,
             )))
         }),
     )

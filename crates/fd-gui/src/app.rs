@@ -9,7 +9,7 @@ use eframe::egui::{
 };
 use fd_core::burst::{self, Burst, LogicalImage};
 use fd_core::meta::FileMeta;
-use fd_core::pipeline::{Engine, Event, JobKind};
+use fd_core::pipeline::{Engine, Event, JobKind, TrackRequest};
 
 const AUTO_PICK_N: usize = 2;
 const THUMB_BUDGET: usize = 1500;
@@ -47,6 +47,18 @@ struct Tex {
     last_used: u64,
 }
 
+/// Click-and-track state for one burst.
+#[derive(Default)]
+struct RoiTrack {
+    req_id: u64,
+    /// meta idx -> (x, y, confidence), normalized coordinates.
+    points: HashMap<usize, (f32, f32, f32)>,
+    /// meta idx -> sharpness at the tracked point.
+    roi_scores: HashMap<usize, f32>,
+}
+
+const CONF_OK: f32 = 0.55;
+
 struct HarvestUi {
     open: bool,
     do_xmp: bool,
@@ -71,6 +83,9 @@ pub struct App {
     /// Per logical image (keyed by primary meta idx).
     state: HashMap<usize, ImgState>,
     scores: HashMap<usize, f32>,
+    roi: HashMap<usize, RoiTrack>,
+    track_burst: HashMap<u64, usize>,
+    next_track_id: u64,
     undo: Vec<Vec<(usize, ImgState)>>,
     view: View,
     overview_cursor: usize,
@@ -91,6 +106,7 @@ pub struct App {
     screenshot: Option<PathBuf>,
     shot_frames: u64,
     open_burst: Option<usize>,
+    auto_track: Option<(f32, f32)>,
 }
 
 impl App {
@@ -100,6 +116,7 @@ impl App {
         screenshot: Option<PathBuf>,
         shot_frames: u64,
         open_burst: Option<usize>,
+        auto_track: Option<(f32, f32)>,
     ) -> Self {
         let workers = std::thread::available_parallelism()
             .map(|v| v.get().saturating_sub(2).max(2))
@@ -113,6 +130,9 @@ impl App {
             bursts: Vec::new(),
             state: HashMap::new(),
             scores: HashMap::new(),
+            roi: HashMap::new(),
+            track_burst: HashMap::new(),
+            next_track_id: 0,
             undo: Vec::new(),
             view: View::Overview,
             overview_cursor: 0,
@@ -139,6 +159,7 @@ impl App {
             screenshot,
             shot_frames,
             open_burst,
+            auto_track,
         }
     }
 
@@ -156,7 +177,12 @@ impl App {
                     self.load_session();
                     if let Some(b) = self.open_burst.take() {
                         if !self.bursts.is_empty() {
-                            self.enter_burst(b.min(self.bursts.len() - 1));
+                            let b = b.min(self.bursts.len() - 1);
+                            self.enter_burst(b);
+                            if let Some((nx, ny)) = self.auto_track.take() {
+                                let seed = self.bursts[b].images[0].primary();
+                                self.start_track(b, seed, nx, ny);
+                            }
                         }
                     }
                     // background scoring for every logical image
@@ -192,6 +218,22 @@ impl App {
                 }
                 Event::Score { idx, score } => {
                     self.scores.insert(idx, score);
+                }
+                Event::TrackPoint {
+                    req_id,
+                    idx,
+                    x,
+                    y,
+                    conf,
+                    roi_score,
+                } => {
+                    if let Some(&b) = self.track_burst.get(&req_id) {
+                        let entry = self.roi.entry(b).or_default();
+                        if entry.req_id == req_id {
+                            entry.points.insert(idx, (x, y, conf));
+                            entry.roi_scores.insert(idx, roi_score);
+                        }
+                    }
                 }
             }
         }
@@ -272,33 +314,51 @@ impl App {
             .all(|li| self.img_state(li.primary()).flag != Flag::Unrated)
     }
 
+    /// Ranking key: ROI sharpness when a confident track exists (tracked
+    /// frames always outrank lost/untracked ones), else global sharpness.
+    fn effective_score(&self, b: usize, id: usize) -> (bool, f32) {
+        if let Some(t) = self.roi.get(&b) {
+            if let (Some(&(_, _, conf)), Some(&rs)) =
+                (t.points.get(&id), t.roi_scores.get(&id))
+            {
+                if conf >= CONF_OK {
+                    return (true, rs);
+                }
+                return (false, self.scores.get(&id).copied().unwrap_or(0.0));
+            }
+        }
+        (
+            self.roi.get(&b).is_none(),
+            self.scores.get(&id).copied().unwrap_or(0.0),
+        )
+    }
+
+    fn rank_by_score(&self, b: usize, idxs: &mut Vec<usize>) {
+        let burst = &self.bursts[b];
+        idxs.sort_by(|&x, &y| {
+            let (tx, sx) = self.effective_score(b, burst.images[x].primary());
+            let (ty, sy) = self.effective_score(b, burst.images[y].primary());
+            ty.cmp(&tx)
+                .then(sy.partial_cmp(&sx).unwrap_or(std::cmp::Ordering::Equal))
+        });
+    }
+
     /// Frame display order for a burst under the current sort mode.
     fn order(&self, b: usize) -> Vec<usize> {
-        let burst = &self.bursts[b];
-        let mut idxs: Vec<usize> = (0..burst.images.len()).collect();
+        let mut idxs: Vec<usize> = (0..self.bursts[b].images.len()).collect();
         if self.sort == SortMode::Sharpness {
-            idxs.sort_by(|&x, &y| {
-                let sx = self.scores.get(&burst.images[x].primary()).copied();
-                let sy = self.scores.get(&burst.images[y].primary()).copied();
-                sy.partial_cmp(&sx).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            self.rank_by_score(b, &mut idxs);
         }
         idxs
     }
 
     fn accept_burst(&mut self, b: usize) {
-        let order = self.order(b);
         let burst = &self.bursts[b];
         let mut changes = Vec::new();
         // Top-N by sharpness regardless of current sort mode.
-        let mut by_score: Vec<usize> = order.clone();
-        if self.sort == SortMode::Time {
-            by_score.sort_by(|&x, &y| {
-                let sx = self.scores.get(&burst.images[x].primary()).copied();
-                let sy = self.scores.get(&burst.images[y].primary()).copied();
-                sy.partial_cmp(&sx).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
+        let mut by_score: Vec<usize> = (0..burst.images.len()).collect();
+        self.rank_by_score(b, &mut by_score);
+        let burst = &self.bursts[b];
         for (rank, &fi) in by_score.iter().enumerate() {
             let id = burst.images[fi].primary();
             let mut st = self.img_state(id);
@@ -539,6 +599,28 @@ impl App {
         }
     }
 
+    fn start_track(&mut self, b: usize, seed_id: usize, nx: f32, ny: f32) {
+        self.next_track_id += 1;
+        let req_id = self.next_track_id;
+        let frames: Vec<usize> = self.bursts[b].images.iter().map(|li| li.primary()).collect();
+        self.track_burst.insert(req_id, b);
+        self.roi.insert(
+            b,
+            RoiTrack {
+                req_id,
+                points: HashMap::new(),
+                roi_scores: HashMap::new(),
+            },
+        );
+        self.engine.request_track(TrackRequest {
+            req_id,
+            frames,
+            seed_frame: seed_id,
+            seed_x: nx,
+            seed_y: ny,
+        });
+    }
+
     fn enter_burst(&mut self, b: usize) {
         self.view = View::Burst { b, frame: 0 };
         self.zoom_100 = false;
@@ -764,6 +846,7 @@ impl App {
             (tid, Vec2::ZERO)
         };
 
+        let mut display_rect: Option<Rect> = None;
         if let Some(tid) = tid {
             if self.zoom_100 {
                 if main_resp.dragged() {
@@ -771,7 +854,7 @@ impl App {
                 }
                 // 1:1 pixels around center + pan
                 let size = native;
-                let mut min = main_rect.center() - size * 0.5 + self.pan;
+                let min = main_rect.center() - size * 0.5 + self.pan;
                 let img_rect = Rect::from_min_size(min.round(), size);
                 ui.painter().with_clip_rect(main_rect).image(
                     tid,
@@ -779,6 +862,7 @@ impl App {
                     Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
+                display_rect = Some(img_rect);
                 let chip = if self.textures.contains_key(&(JobKind::Full, id)) {
                     "FULL"
                 } else {
@@ -810,6 +894,7 @@ impl App {
                     Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
+                display_rect = Some(img_rect);
             }
         } else {
             ui.painter().text(
@@ -820,18 +905,52 @@ impl App {
                 Color32::from_gray(120),
             );
         }
-        if main_resp.double_clicked() {
-            self.zoom_100 = !self.zoom_100;
-            self.pan = Vec2::ZERO;
+
+        // Click on the image = set the tracking point (e.g. the eye).
+        if let (Some(img_rect), true) = (display_rect, main_resp.clicked()) {
+            if let Some(pos) = main_resp.interact_pointer_pos() {
+                let nx = (pos.x - img_rect.min.x) / img_rect.width();
+                let ny = (pos.y - img_rect.min.y) / img_rect.height();
+                if (0.0..=1.0).contains(&nx) && (0.0..=1.0).contains(&ny) {
+                    self.start_track(b, id, nx, ny);
+                }
+            }
+        }
+
+        // ROI overlay on the main image.
+        if let Some((img_rect, &(x, y, conf))) = display_rect
+            .zip(self.roi.get(&b).and_then(|t| t.points.get(&id)))
+        {
+            let center = egui::pos2(
+                img_rect.min.x + x * img_rect.width(),
+                img_rect.min.y + y * img_rect.height(),
+            );
+            let side = (64.0 / 1620.0) * img_rect.width();
+            let color = if conf >= 0.75 {
+                Color32::from_rgb(80, 200, 90)
+            } else if conf >= CONF_OK {
+                Color32::from_rgb(230, 180, 60)
+            } else {
+                Color32::from_rgb(220, 70, 70)
+            };
+            ui.painter().with_clip_rect(main_rect).rect_stroke(
+                Rect::from_center_size(center, Vec2::splat(side)),
+                2.0,
+                Stroke::new(2.0, color),
+                egui::StrokeKind::Outside,
+            );
         }
 
         // overlay: filename + score + state
         let st = self.img_state(id);
-        let score_txt = self
-            .scores
-            .get(&id)
-            .map(|s| format!("{s:.1}"))
-            .unwrap_or_else(|| "…".into());
+        let score_txt = match self.roi.get(&b).and_then(|t| t.roi_scores.get(&id)) {
+            Some(rs) => format!("ROI {rs:.1}"),
+            None => self
+                .scores
+                .get(&id)
+                .map(|s| format!("{s:.1}"))
+                .unwrap_or_else(|| "…".into()),
+        };
         let flag_txt = match st.flag {
             Flag::Picked => " · PICK",
             Flag::Rejected => " · REJECT",
@@ -890,6 +1009,28 @@ impl App {
                                 tint,
                             );
                         }
+                        // mini ROI box with confidence color
+                        if let Some(&(x, y, conf)) =
+                            self.roi.get(&b).and_then(|t| t.points.get(&fid))
+                        {
+                            let c = egui::pos2(
+                                img_rect.min.x + x * img_rect.width(),
+                                img_rect.min.y + y * img_rect.height(),
+                            );
+                            let color = if conf >= 0.75 {
+                                Color32::from_rgb(80, 200, 90)
+                            } else if conf >= CONF_OK {
+                                Color32::from_rgb(230, 180, 60)
+                            } else {
+                                Color32::from_rgb(220, 70, 70)
+                            };
+                            ui.painter().with_clip_rect(img_rect).rect_stroke(
+                                Rect::from_center_size(c, Vec2::splat(7.0)),
+                                1.0,
+                                Stroke::new(1.5, color),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
                         let sst = self.img_state(fid);
                         let border = if pos == frame {
                             Stroke::new(3.0, Color32::from_rgb(90, 160, 255))
@@ -902,11 +1043,14 @@ impl App {
                         };
                         ui.painter()
                             .rect_stroke(img_rect, 3.0, border, egui::StrokeKind::Outside);
-                        let s = self
-                            .scores
-                            .get(&fid)
-                            .map(|s| format!("{s:.1}"))
-                            .unwrap_or_else(|| "…".into());
+                        let s = match self.roi.get(&b).and_then(|t| t.roi_scores.get(&fid)) {
+                            Some(rs) => format!("•{rs:.1}"),
+                            None => self
+                                .scores
+                                .get(&fid)
+                                .map(|s| format!("{s:.1}"))
+                                .unwrap_or_else(|| "…".into()),
+                        };
                         let flag_c = match sst.flag {
                             Flag::Picked => "P ",
                             Flag::Rejected => "X ",
@@ -1054,6 +1198,9 @@ impl App {
                 ui.monospace(
                     "Overview   arrows move · Enter open burst · N next unculled\n\
                      Burst      ←/→ frame · ↑/↓ burst · Esc back · Z zoom 100%\n\
+                     Track      click the subject (e.g. the eye) — the point is tracked\n\
+                                through the burst and frames re-rank by sharpness there;\n\
+                                box color = confidence (green/amber/red); re-click to fix\n\
                      Flags      P pick · X reject · U clear · 1–5/0 stars\n\
                      Burst ops  Ctrl+Enter accept top-2 + reject rest · Ctrl+X reject all\n\
                      Other      O sort time/sharpness · Ctrl+Z undo · Ctrl+H harvest\n\

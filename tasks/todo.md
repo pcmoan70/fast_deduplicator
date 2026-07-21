@@ -38,7 +38,13 @@ Test corpus: /home/pc/temp/EOSR5_20251014/100EOSR5/ (5,575 files, 103 GB, R5 CR3
 - [x] --screenshot self-test mode; verified overview/burst/full-card renders on real corpus (595 stacks streaming)
 - [ ] User acceptance pass (interactive feel, keyboard flow) — needs eyes on screen
 - Note: DPMS-off suppresses repaints (found during headless testing) — irrelevant in real use
-## M3 — Click-ROI + NCC tracking + ROI ranking
+## M3 — Click-ROI + NCC tracking + ROI ranking  ✅ first cut 2026-07-22
+- [x] fd-core::track: pyramid-free coarse-to-fine NCC (stride 8→2→1, ±96px window), dual template (original + adaptive), confidence = NCC peak; unit tests (translation follow, lost-track low conf)
+- [x] Engine track jobs: bidirectional from seed, per-frame TrackPoint events (normalized coords + conf + ROI sharpness), newer request aborts older
+- [x] GUI: click on image = set track point; ROI box overlay (green/amber/red by confidence) on main + mini-box on strip; ROI scores in badges; ranking prefers confident ROI scores (lost frames sink); Ctrl+Enter uses ROI ranking
+- [x] ~45 ms/frame track (decode 5 ms + NCC 40 ms); 16-frame burst < 1 s
+- [x] Verified on real corpus: bird burst tracked, box rendered, strip re-ranked (screenshots)
+- [ ] Later: keyframe correction UI (re-click mid-burst merges), confidence sparkline, threshold slider, top-K full-res refinement
 ## M4 — HEIF, DPRAW, trash-rejects, packaging
 ## M5 — (stretch) web build
 

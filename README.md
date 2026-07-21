@@ -5,8 +5,9 @@ files in seconds, groups burst sequences, ranks frames by sharpness at a
 point you click once (e.g. a bird's eye, tracked through the burst), and
 harvests the keepers: XMP ratings, copy picks, trash rejects.
 
-*Updated: 2026-07-22 — status: M0+M1 done; M2 GUI first cut done
-(browse/cull/harvest); next: ROI click-and-track (M3).*
+*Updated: 2026-07-22 — status: M0–M3 first cuts done: format core, burst
+grouping + sharpness ranking (CLI), GUI browse/cull/harvest, click-once
+eye tracking with ROI ranking. Next: HEIF, trash-rejects, packaging (M4).*
 
 ## GUI
 
@@ -21,6 +22,12 @@ and rejects the rest, `N` jumps to the next unculled burst, `Z` toggles
 100% zoom (preview first, full-res swaps in). `Ctrl+H` opens Harvest
 (XMP sidecars + copy picks). `?` shows all keys. Flags autosave to a
 session file; reopening the folder resumes where you left off.
+
+**Click-and-track:** click the critical point (e.g. the bird's eye) on the
+main image. The point is tracked through the whole burst and every frame
+gets a box colored by tracking confidence (green/amber/red); the filmstrip
+re-ranks by sharpness *at that point*. Re-click anywhere to move the
+track; frames where the track was lost rank last.
 
 ## Why it's fast
 

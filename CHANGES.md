@@ -1,5 +1,18 @@
 # Changes
 
+## 2026-07-22 — M3 (first cut): click-once eye tracking
+- Click any point on the main image (the bird's eye): an NCC template
+  tracker follows it bidirectionally through the burst on preview-res luma
+  (~45 ms/frame), dual-template drift control, per-frame confidence.
+- ROI box overlay on main image and filmstrip thumbs, colored by
+  confidence (green/amber/red). Re-click replaces the track; a newer
+  request aborts an in-flight one.
+- Frames re-rank by sharpness at the tracked point; low-confidence frames
+  fall back to global sharpness and always rank below tracked frames.
+  Ctrl+Enter accept-burst uses the ROI ranking.
+- Unit tests: tracker follows synthetic translations (<1.5 px error),
+  reports low confidence on unrelated frames.
+
 ## 2026-07-22 — M2 (first cut): GUI
 - New `fd-gui` binary (egui/eframe): Card Overview of burst stacks
   (virtualized grid, cull-state rings, pick tallies), Burst View with main
