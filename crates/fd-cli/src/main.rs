@@ -54,6 +54,17 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Execute a cull recipe written by the GUI (step two of harvest).
+    Apply {
+        /// Recipe JSON produced by Harvest.
+        recipe: PathBuf,
+        /// Report what would happen; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print one line per action, not just the summary.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Time each pipeline stage for one file (parse/extract/decode/score).
     Bench { file: PathBuf },
 }
@@ -76,8 +87,60 @@ fn main() -> Result<()> {
             cache,
             dry_run,
         } => cull(dir, top, gap, xmp, copy_to, cache, dry_run),
+        Cmd::Apply {
+            recipe,
+            dry_run,
+            verbose,
+        } => apply(recipe, dry_run, verbose),
         Cmd::Bench { file } => bench(file),
     }
+}
+
+/// Step two of harvest: run a recipe the GUI built and you reviewed.
+fn apply(path: PathBuf, dry_run: bool, verbose: bool) -> Result<()> {
+    use fd_core::recipe::{self, Severity};
+
+    let r = recipe::Recipe::load(&path)?;
+    println!(
+        "recipe v{} · folder {} · {} actions ({} enabled)",
+        r.version,
+        r.folder.display(),
+        r.actions.len(),
+        r.active_count()
+    );
+
+    let issues = recipe::check(&r);
+    let errors = issues.iter().filter(|i| i.severity == Severity::Error).count();
+    for i in &issues {
+        let tag = match i.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warn ",
+        };
+        let file = r.actions[i.action].file.display();
+        println!("  {tag} {file}: {}", i.message);
+    }
+    if errors > 0 && !dry_run {
+        anyhow::bail!("{errors} errors — fix them or re-run with --dry-run to inspect");
+    }
+
+    let report = recipe::execute(&r, dry_run, |_, _| {});
+    if verbose {
+        for o in &report.outcomes {
+            match &o.error {
+                Some(e) => println!("  FAILED {}: {e}", o.file.display()),
+                None => println!("  {} · {}", o.file.display(), o.detail),
+            }
+        }
+    }
+    println!("{}", report.summary());
+    for o in report.failures() {
+        eprintln!(
+            "failed: {} — {}",
+            o.file.display(),
+            o.error.clone().unwrap_or_default()
+        );
+    }
+    Ok(())
 }
 
 fn bench(file: PathBuf) -> Result<()> {

@@ -1,6 +1,7 @@
 # Architecture
 
-*Updated: 2026-07-21 (M0 complete; M1+ sections describe the approved design).*
+*Updated: 2026-08-03 (M0–M3 built; GUI control system and recipe harvest
+added. Remaining M4+ sections describe the approved design).*
 
 ## Core principle
 
@@ -32,6 +33,7 @@ graph LR
     B[burst grouping M1]
     C[cache: sqlite M1]
     O[output: xmp, harvest M1]
+    R[recipe: plan, check, execute]
   end
 ```
 
@@ -77,8 +79,68 @@ SQLite (WAL, one writer thread): `files`, `thumbs`, `scores`, `bursts`,
 `roi_tracks`, `decisions`. Key = `(size, mtime, xxh3 of first 64 KB)` —
 survives remounts/drive letters. Reopen of a scanned card ≈ 1 s.
 
-## Outputs (M1/M2)
+## GUI structure
 
-XMP sidecars (never touch originals), templated copy of picks
-(RAW + sidecar + paired JPEG atomically), rejects to OS trash only, deletes
-run last so cancel is clean.
+Four panels around the content area. The menu bar is the complete inventory of
+what the app can do; the toolbar is the frequent subset for the current view;
+the status bar is the only place that reports state.
+
+```mermaid
+flowchart TB
+  M[menu bar · File Edit View Burst Help] --> C
+  T[toolbar · context-sensitive per view] --> C
+  C[central · burst grid or burst view]
+  C --> S[status bar · counts, scan/score progress, cursor position]
+```
+
+### One action layer
+
+Keyboard, menu and toolbar are three routes to the same enum. `Action` is the
+vocabulary, `App::perform` the only implementation, `App::enabled` the single
+predicate deciding whether something applies right now — which is also what
+greys out menu entries, so the menus advertise capabilities that are
+momentarily unavailable rather than hiding them.
+
+```mermaid
+flowchart LR
+  K[KEYMAP · key+ctrl] --> A[Action]
+  MB[menu bar] --> A
+  TB[toolbar] --> A
+  A --> EN{App::enabled?}
+  EN -- yes --> P[App::perform]
+  EN -- no --> G[greyed out]
+```
+
+`KEYMAP` is data, not code, so a unit test can prove no key+modifier is bound
+twice. Context-sensitivity (an arrow moves the grid cursor in Overview and the
+frame in Burst) lives in `perform`, not in the binding table.
+
+## Outputs: the two-step harvest
+
+Originals are never modified. Every edit goes through a **recipe**
+(`fd-core/src/recipe.rs`) rather than being applied as the user clicks:
+
+```mermaid
+flowchart LR
+  SESS[culling session\npicks, ratings, ranking] --> BUILD[build_recipe]
+  BUILD --> J[(cull-recipe.json)]
+  J --> CHK[recipe::check\nread-only preconditions]
+  CHK --> REV[review table\nfile · op · burst · rank · sharp · track · why]
+  REV -->|per-row toggles| EX[recipe::execute]
+  J -->|fd apply| EX
+  EX --> OUT[output::write_sidecar\noutput::copy_pick]
+  EX -->|dry_run| NOOP[reports intent, writes nothing]
+```
+
+Each `PlannedAction` carries the evidence behind the decision — burst number,
+rank within the burst, sharpness, ROI sharpness and tracker confidence, plus a
+plain-language reason. That is what makes the automated steps auditable: the
+user confirms the grouping and ranking detected what was intended *before* any
+file is touched.
+
+`execute` is the single writer for both the GUI and `fd apply`, and it only
+ever calls the existing `output` helpers. `check` never writes. `Skip` rows are
+part of the recipe so what is being left behind is reviewable too.
+
+Still planned (M4): rejects to OS trash, deletes running last so cancel is
+clean.

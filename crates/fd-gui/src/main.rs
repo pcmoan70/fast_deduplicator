@@ -9,6 +9,8 @@ fn main() -> eframe::Result {
     let mut shot_frames = 30u64;
     let mut open_burst: Option<usize> = None;
     let mut auto_track: Option<(f32, f32)> = None;
+    let mut build_recipe: Option<PathBuf> = None;
+    let mut open_harvest = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--screenshot" => screenshot = args.next().map(PathBuf::from),
@@ -16,6 +18,8 @@ fn main() -> eframe::Result {
                 shot_frames = args.next().and_then(|v| v.parse().ok()).unwrap_or(30)
             }
             "--open-burst" => open_burst = args.next().and_then(|v| v.parse().ok()),
+            "--build-recipe" => build_recipe = args.next().map(PathBuf::from),
+            "--open-harvest" => open_harvest = true,
             "--auto-track" => {
                 auto_track = args.next().and_then(|v| {
                     let (x, y) = v.split_once(',')?;
@@ -26,7 +30,11 @@ fn main() -> eframe::Result {
         }
     }
     let Some(dir) = dir else {
-        eprintln!("usage: fd-gui <image-folder> [--screenshot out.png --shot-frames N]");
+        eprintln!(
+            "usage: fd-gui <image-folder>\n\
+             self-test flags: --screenshot out.png --shot-frames N --open-burst N\n\
+             --auto-track x,y --build-recipe out.json"
+        );
         std::process::exit(2);
     };
 
@@ -47,7 +55,17 @@ fn main() -> eframe::Result {
                 shot_frames,
                 open_burst,
                 auto_track,
+                build_recipe,
+                open_harvest,
             )))
         }),
     )
+}
+
+/// eframe's `default_fonts` feature is easy to lose when trimming
+/// `default-features`; without it egui draws no text at all and the whole UI
+/// goes blank with no error.
+#[test]
+fn default_fonts_are_embedded() {
+    assert!(!eframe::egui::FontDefinitions::default().font_data.is_empty());
 }

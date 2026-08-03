@@ -10,5 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 fd-core = { path = "../fd-core" }
-eframe = { version = "0.31", default-features = false, features = ["glow", "wayland", "x11"] }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
+serde_json.workspace = true

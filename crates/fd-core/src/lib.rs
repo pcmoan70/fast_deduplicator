@@ -6,6 +6,7 @@ pub mod io;
 pub mod meta;
 pub mod output;
 pub mod pipeline;
+pub mod recipe;
 pub mod score;
 pub mod track;
 
