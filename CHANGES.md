@@ -1,5 +1,15 @@
 # Changes
 
+## 2026-08-03 — Inspect mode
+- New `I` shortcut (plus View menu and toolbar button): shows the
+  full-resolution embedded JPEG at 1:1, auto-centered on the tracked focus
+  point of the current frame. Navigating frames keeps the point pinned at
+  the viewport center, so the eye stays put while sharpness varies around
+  it. Falls back to image center (labelled in the chip) when no track
+  exists. Neighbour frames' full-res JPEGs are prefetched (texture budget
+  3) so Left/Right lands on FULL, not PREVIEW. Zoom and inspect are
+  mutually exclusive; both drop back to fit on burst change or Esc.
+
 ## 2026-08-03 — Menu/toolbar control system + reviewable recipe harvest
 
 **Controls.** The GUI was keyboard-only: three header buttons, everything

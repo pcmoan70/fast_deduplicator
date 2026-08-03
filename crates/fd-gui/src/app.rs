@@ -15,7 +15,9 @@ use fd_core::recipe::{self, Issue, Op, PlannedAction, Recipe, Report, Severity, 
 const AUTO_PICK_N: usize = 2;
 const THUMB_BUDGET: usize = 1500;
 const PREVIEW_BUDGET: usize = 8;
-const FULL_BUDGET: usize = 2;
+// Current frame + both inspect-mode neighbors (a 45 MP RGBA texture is
+// ~180 MB, so this budget is deliberately tight).
+const FULL_BUDGET: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Flag {
@@ -74,6 +76,7 @@ enum Action {
     ClearTrack,
     // View
     ToggleZoom,
+    ToggleInspect,
     ToggleSort,
     SetSort(SortMode),
     // Help
@@ -109,6 +112,7 @@ impl Action {
         Action::RejectAll,
         Action::ClearTrack,
         Action::ToggleZoom,
+        Action::ToggleInspect,
         Action::ToggleSort,
         Action::SetSort(SortMode::Time),
         Action::SetSort(SortMode::Sharpness),
@@ -140,6 +144,7 @@ impl Action {
             Action::RejectAll => "Reject All Frames".into(),
             Action::ClearTrack => "Clear Tracking Point".into(),
             Action::ToggleZoom => "Zoom 100%".into(),
+            Action::ToggleInspect => "Inspect Focus Point".into(),
             Action::ToggleSort => "Toggle Sort Order".into(),
             Action::SetSort(SortMode::Time) => "Sort by Capture Time".into(),
             Action::SetSort(SortMode::Sharpness) => "Sort by Sharpness".into(),
@@ -175,6 +180,7 @@ impl Action {
             Action::AcceptTop => "Ctrl+Enter",
             Action::RejectAll => "Ctrl+X",
             Action::ToggleZoom => "Z",
+            Action::ToggleInspect => "I",
             Action::ToggleSort | Action::SetSort(_) => "O",
             Action::ToggleHelp => "?",
             Action::OpenRecipe | Action::ClearTrack | Action::ShowAbout | Action::Rate(_) => "",
@@ -200,6 +206,7 @@ const KEYMAP: &[(Key, bool, Action)] = &[
     (Key::X, false, Action::Reject),
     (Key::U, false, Action::ClearFlag),
     (Key::Z, false, Action::ToggleZoom),
+    (Key::I, false, Action::ToggleInspect),
     (Key::O, false, Action::ToggleSort),
     (Key::H, false, Action::ToggleHelp),
     (Key::Questionmark, false, Action::ToggleHelp),
@@ -324,6 +331,9 @@ pub struct App {
     overview_cursor: usize,
     sort: SortMode,
     zoom_100: bool,
+    /// Inspection mode: full-res JPEG at 1:1, auto-centered on the tracked
+    /// focus point of each frame (image center when no track exists).
+    inspect: bool,
     pan: Vec2,
     textures: HashMap<(JobKind, usize), Tex>,
     requested: HashSet<(JobKind, usize)>,
@@ -347,6 +357,8 @@ pub struct App {
     build_recipe_to: Option<PathBuf>,
     /// Self-test: same, but open the Harvest review table instead of exiting.
     open_harvest: bool,
+    /// Self-test: enter inspect mode once the burst is open.
+    start_inspect: bool,
 }
 
 impl App {
@@ -359,6 +371,7 @@ impl App {
         auto_track: Option<(f32, f32)>,
         build_recipe_to: Option<PathBuf>,
         open_harvest: bool,
+        start_inspect: bool,
     ) -> Self {
         let workers = std::thread::available_parallelism()
             .map(|v| v.get().saturating_sub(2).max(2))
@@ -380,6 +393,7 @@ impl App {
             overview_cursor: 0,
             sort: SortMode::Sharpness,
             zoom_100: false,
+            inspect: false,
             pan: Vec2::ZERO,
             textures: HashMap::new(),
             requested: HashSet::new(),
@@ -399,6 +413,7 @@ impl App {
             auto_track,
             build_recipe_to,
             open_harvest,
+            start_inspect,
         }
     }
 
@@ -421,6 +436,9 @@ impl App {
                             if let Some((nx, ny)) = self.auto_track.take() {
                                 let seed = self.bursts[b].images[0].primary();
                                 self.start_track(b, seed, nx, ny);
+                            }
+                            if self.start_inspect {
+                                self.inspect = true;
                             }
                         }
                     }
@@ -769,7 +787,10 @@ impl App {
             Action::BackToOverview => in_burst,
             Action::NextUnculled => has_bursts,
             Action::NavLeft | Action::NavRight | Action::NavUp | Action::NavDown => has_bursts,
-            Action::AcceptTop | Action::RejectAll | Action::ToggleZoom => in_burst,
+            Action::AcceptTop
+            | Action::RejectAll
+            | Action::ToggleZoom
+            | Action::ToggleInspect => in_burst,
             Action::ClearTrack => match self.view {
                 View::Burst { b, .. } => self.roi.contains_key(&b),
                 View::Overview => false,
@@ -815,6 +836,7 @@ impl App {
                     self.overview_cursor = b;
                     self.view = View::Overview;
                     self.zoom_100 = false;
+                    self.inspect = false;
                 }
             }
             Action::NextUnculled => {
@@ -887,6 +909,12 @@ impl App {
             }
             Action::ToggleZoom => {
                 self.zoom_100 = !self.zoom_100;
+                self.inspect = false;
+                self.pan = Vec2::ZERO;
+            }
+            Action::ToggleInspect => {
+                self.inspect = !self.inspect;
+                self.zoom_100 = false;
                 self.pan = Vec2::ZERO;
             }
             Action::ToggleSort => {
@@ -926,6 +954,7 @@ impl App {
         self.view = View::Overview;
         self.overview_cursor = 0;
         self.zoom_100 = false;
+        self.inspect = false;
         self.pan = Vec2::ZERO;
         self.scan_done = false;
         self.scan_started = Instant::now();
@@ -959,6 +988,7 @@ impl App {
     fn enter_burst(&mut self, b: usize) {
         self.view = View::Burst { b, frame: 0 };
         self.zoom_100 = false;
+        self.inspect = false;
         self.pan = Vec2::ZERO;
     }
 
@@ -1042,6 +1072,9 @@ impl App {
                 if self.menu_item(ui, Action::ToggleZoom, Some(self.zoom_100)) {
                     fired = Some(Action::ToggleZoom);
                 }
+                if self.menu_item(ui, Action::ToggleInspect, Some(self.inspect)) {
+                    fired = Some(Action::ToggleInspect);
+                }
             });
             ui.menu_button("Burst", |ui| {
                 for a in [Action::AcceptTop, Action::RejectAll] {
@@ -1120,6 +1153,16 @@ impl App {
                     ui.separator();
                     if self.tool_button(ui, Action::ToggleZoom, "100%") {
                         fired = Some(Action::ToggleZoom);
+                    }
+                    if ui
+                        .add_enabled(
+                            self.enabled(Action::ToggleInspect),
+                            egui::Button::new("Inspect").selected(self.inspect),
+                        )
+                        .on_hover_text("Full-res JPEG centered on the focus point  (I)")
+                        .clicked()
+                    {
+                        fired = Some(Action::ToggleInspect);
                     }
                     ui.separator();
                     if self.tool_button(ui, Action::AcceptTop, &format!("Accept top {AUTO_PICK_N}"))
@@ -1473,8 +1516,9 @@ impl App {
         );
         ui.painter().rect_filled(main_rect, 0.0, Color32::from_gray(12));
 
+        let magnified = self.zoom_100 || self.inspect;
         let full_tid = self.textures.get(&(JobKind::Full, id)).map(|t| t.handle.id());
-        let (tid, native) = if self.zoom_100 {
+        let (tid, native) = if magnified {
             self.tex(JobKind::Full, id, 100);
             let t = self
                 .textures
@@ -1499,15 +1543,28 @@ impl App {
             (tid, Vec2::ZERO)
         };
 
+        // What the 1:1 view centers on: the frame's tracked focus point in
+        // inspect mode, the image center otherwise.
+        let anchor = if self.inspect {
+            self.roi
+                .get(&b)
+                .and_then(|t| t.points.get(&id))
+                .map(|&(x, y, _)| Vec2::new(x, y))
+                .unwrap_or(Vec2::new(0.5, 0.5))
+        } else {
+            Vec2::new(0.5, 0.5)
+        };
+
         let mut display_rect: Option<Rect> = None;
         if let Some(tid) = tid {
-            if self.zoom_100 {
+            if magnified {
                 if main_resp.dragged() {
                     self.pan += main_resp.drag_delta();
                 }
-                // 1:1 pixels around center + pan
+                // 1:1 pixels with the anchor at the viewport center + pan
                 let size = native;
-                let min = main_rect.center() - size * 0.5 + self.pan;
+                let min =
+                    main_rect.center() - Vec2::new(anchor.x * size.x, anchor.y * size.y) + self.pan;
                 let img_rect = Rect::from_min_size(min.round(), size);
                 ui.painter().with_clip_rect(main_rect).image(
                     tid,
@@ -1516,15 +1573,24 @@ impl App {
                     Color32::WHITE,
                 );
                 display_rect = Some(img_rect);
-                let chip = if self.textures.contains_key(&(JobKind::Full, id)) {
+                let res = if self.textures.contains_key(&(JobKind::Full, id)) {
                     "FULL"
                 } else {
                     "PREVIEW"
                 };
+                let mode = if self.inspect {
+                    if self.roi.get(&b).is_some_and(|t| t.points.contains_key(&id)) {
+                        "INSPECT focus point"
+                    } else {
+                        "INSPECT center (no track - click the subject)"
+                    }
+                } else {
+                    "100%"
+                };
                 ui.painter().text(
                     main_rect.left_top() + Vec2::new(8.0, 8.0),
                     Align2::LEFT_TOP,
-                    format!("100% · {chip}"),
+                    format!("{mode} · {res}"),
                     FontId::proportional(13.0),
                     Color32::from_rgb(230, 180, 60),
                 );
@@ -1720,6 +1786,18 @@ impl App {
             if frame >= d {
                 let nid = self.bursts[b].images[order[frame - d]].primary();
                 self.tex(JobKind::Preview, nid, 80 - d as i32);
+            }
+        }
+        // In inspect mode flipping frames is the whole point: pre-decode the
+        // neighbors' full-res JPEGs so Left/Right lands on FULL, not PREVIEW.
+        if self.inspect {
+            if frame + 1 < order.len() {
+                let nid = self.bursts[b].images[order[frame + 1]].primary();
+                self.tex(JobKind::Full, nid, 95);
+            }
+            if frame >= 1 {
+                let nid = self.bursts[b].images[order[frame - 1]].primary();
+                self.tex(JobKind::Full, nid, 94);
             }
         }
     }
@@ -2228,7 +2306,10 @@ impl App {
                      Flags      P pick · X reject · U clear · 1-5 stars · 0 none\n\
                      Burst ops  Ctrl+Enter accept top 2 + reject rest\n\
                                 Ctrl+X reject all (asks first)\n\
-                     View       Z zoom 100% · O sort time/sharpness\n\
+                     View       Z zoom 100% · I inspect (full-res JPEG locked\n\
+                                onto the tracked focus point; Left/Right flips\n\
+                                frames with the eye pinned in place)\n\
+                                O sort time/sharpness\n\
                                 N next unculled burst · Ctrl+Z undo\n\
                      Track      click the subject (e.g. the eye) — it is tracked\n\
                                 through the burst and frames re-rank by sharpness\n\

@@ -37,6 +37,15 @@ sharpness *at that point*. The toolbar shows the current tracking confidence
 and a button to clear it. Re-click anywhere to move the track; frames where the
 track was lost rank last.
 
+**Inspect mode (`I`):** the full-resolution embedded JPEG at 1:1, automatically
+centered on the tracked focus point of *each* frame — flip through the burst
+with Left/Right and the eye stays pinned in place while the rest of the frame
+moves around it, which makes the sharpness difference between neighbouring
+frames obvious. Without a track it centers on the image middle (the chip says
+so — click the subject to get the real thing). Neighbour frames are pre-decoded
+so flipping lands on full resolution, and drag still pans if you want to look
+around. `I` or `Z` leaves the mode.
+
 ## Harvest is two steps, and you check the middle one
 
 `Ctrl+H` does not write anything. It builds a **recipe** — a JSON list of every
