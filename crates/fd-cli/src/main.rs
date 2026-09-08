@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use fd_core::formats;
+use fd_core::formats::{self, Source};
 use fd_core::meta::FileMeta;
 use rayon::prelude::*;
 
@@ -50,6 +50,9 @@ enum Cmd {
         /// Score cache location (default: <dir>/.fd-cache.db).
         #[arg(long)]
         cache: Option<PathBuf>,
+        /// Score from the embedded preview (default) or the full image.
+        #[arg(long, default_value = "embedded")]
+        source: Source,
         /// Only list bursts and picks; write/copy nothing.
         #[arg(long)]
         dry_run: bool,
@@ -85,8 +88,9 @@ fn main() -> Result<()> {
             xmp,
             copy_to,
             cache,
+            source,
             dry_run,
-        } => cull(dir, top, gap, xmp, copy_to, cache, dry_run),
+        } => cull(dir, top, gap, xmp, copy_to, cache, source, dry_run),
         Cmd::Apply {
             recipe,
             dry_run,
@@ -156,7 +160,7 @@ fn bench(file: PathBuf) -> Result<()> {
     let t = Instant::now();
     let mut prev = None;
     for _ in 0..n {
-        prev = formats::extract_preview(&meta)?;
+        prev = formats::extract_jpeg(&meta, Source::Embedded)?;
     }
     println!("extract:       {:?}", t.elapsed() / n);
     let (jpeg, _, _) = prev.expect("no preview");
@@ -198,6 +202,7 @@ fn cull(
     xmp: bool,
     copy_to: Option<PathBuf>,
     cache_path: Option<PathBuf>,
+    source: Source,
     dry_run: bool,
 ) -> Result<()> {
     use fd_core::{burst, cache::Cache, decode, output, score};
@@ -218,7 +223,10 @@ fn cull(
         &cache_path.unwrap_or_else(|| dir.join(".fd-cache.db")),
     )
     .map_err(|e| anyhow::anyhow!("cache: {e}"))?;
-    let keys: Vec<String> = metas.iter().map(fd_core::cache::file_key).collect();
+    let keys: Vec<String> = metas
+        .iter()
+        .map(|m| fd_core::cache::file_key(m, source))
+        .collect();
     let t1 = Instant::now();
     let todo: Vec<usize> = bursts
         .iter()
@@ -228,7 +236,7 @@ fn cull(
     let fresh: Vec<(usize, f32)> = todo
         .par_iter()
         .filter_map(|&i| {
-            let (jpeg, _, _) = formats::extract_preview(&metas[i]).ok()??;
+            let (jpeg, _, _) = formats::extract_jpeg(&metas[i], source).ok()??;
             let luma = decode::decode_luma_scaled(&jpeg, 1600).ok()?;
             Some((i, score::score_global(&luma).score))
         })
@@ -284,9 +292,13 @@ fn cull(
     }
 
     println!(
-        "\nscan: {:?} ({} files)  score: {:?} ({} fresh, {} cached)  bursts: {}  picks: {}",
+        "\nscan: {:?} ({} files)  score[{}]: {:?} ({} fresh, {} cached)  bursts: {}  picks: {}",
         t_scan,
         metas.len(),
+        match source {
+            Source::Embedded => "embedded",
+            Source::Full => "full",
+        },
         t_score,
         scored,
         picks.len().saturating_sub(scored.min(picks.len())),
@@ -413,7 +425,7 @@ fn scan(
         let extracted: Vec<_> = metas
             .par_iter()
             .map(|m| {
-                let r = formats::extract_preview(m)?;
+                let r = formats::extract_jpeg(m, Source::Embedded)?;
                 if let Some((jpeg, _, _)) = &r {
                     let name = m.path.file_stem().unwrap().to_string_lossy();
                     std::fs::write(out.join(format!("{}_preview.jpg", name)), jpeg)?;

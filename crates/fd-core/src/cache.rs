@@ -5,6 +5,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+use crate::formats::Source;
 use crate::meta::FileMeta;
 
 pub struct Cache {
@@ -12,9 +13,16 @@ pub struct Cache {
 }
 
 /// Content key: xxh3 of the first 64 KB + file size. RAW files are
-/// immutable, and any rewrite changes the header bytes.
-pub fn file_key(meta: &FileMeta) -> String {
-    format!("{:016x}-{:x}", meta.content_key, meta.size)
+/// immutable, and any rewrite changes the header bytes. Scores from the
+/// full image are not comparable with preview scores, so `Source::Full`
+/// gets its own key (`-full`), and every key carries the scoring formula
+/// version so a formula change orphans old rows instead of mixing scales.
+pub fn file_key(meta: &FileMeta, source: Source) -> String {
+    let v = crate::score::SCORE_VERSION;
+    match source {
+        Source::Embedded => format!("{:016x}-{:x}-s{v}", meta.content_key, meta.size),
+        Source::Full => format!("{:016x}-{:x}-full-s{v}", meta.content_key, meta.size),
+    }
 }
 
 impl Cache {
@@ -52,5 +60,19 @@ impl Cache {
             }
         }
         tx.commit()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::FileKind;
+
+    #[test]
+    fn full_source_gets_its_own_key() {
+        let mut m = FileMeta::new("x.jpg".into(), 0x1234, FileKind::Jpeg);
+        m.content_key = 0xabc;
+        assert_eq!(file_key(&m, Source::Embedded), "0000000000000abc-1234-s2");
+        assert_eq!(file_key(&m, Source::Full), "0000000000000abc-1234-full-s2");
     }
 }

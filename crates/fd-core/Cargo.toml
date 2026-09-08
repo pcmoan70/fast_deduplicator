@@ -21,3 +21,6 @@ xxhash-rust.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 turbojpeg = { version = "1", optional = true }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

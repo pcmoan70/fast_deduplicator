@@ -1,6 +1,7 @@
 pub mod burst;
 pub mod cache;
 pub mod decode;
+pub mod eye;
 pub mod formats;
 pub mod io;
 pub mod meta;

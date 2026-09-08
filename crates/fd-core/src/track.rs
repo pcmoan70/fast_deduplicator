@@ -7,6 +7,8 @@ use crate::decode::Luma;
 
 pub const TEMPLATE: usize = 64; // template side at preview resolution
 pub const SEARCH: usize = 96; // search radius around previous position
+/// NCC confidence below which a tracked point is treated as lost.
+pub const CONF_OK: f32 = 0.55;
 
 #[derive(Clone)]
 pub struct Template {

@@ -129,6 +129,12 @@ pub fn parse<R: ReadRange>(r: &mut R, header: &[u8], meta: &mut FileMeta) -> Res
                         exif::apply_exif_ifd(&t, meta);
                     }
                 }
+                b"CMT3" => {
+                    // Canon MakerNote as its own TIFF: AF box (eye frame).
+                    if let Ok(t) = Tiff::parse(ibuf) {
+                        super::canon::apply_makernote(&t, t.first_ifd, meta);
+                    }
+                }
                 b"THMB" => {
                     // FullBox: ver/flags(4) w(2) h(2) jpeg_size(4) ...
                     let w = be32(ibuf, 4).map(|v| (v >> 16) as u32).unwrap_or(0);

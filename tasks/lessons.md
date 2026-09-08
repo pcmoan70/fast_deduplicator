@@ -51,3 +51,41 @@ Rule: before hunting a deadlock, prove the loop is stopped rather than slow —
 print progress per iteration and scale the timeout to the work requested
 (here, `--shot-frames`). Also: piping a hung process through `head` hides
 its output; redirect to a file instead.
+
+## 2026-09-04 — A per-pixel pass over a 45 MP frame is never free
+The first EXIF-rotate was a plain gather loop with a `match` per pixel; on
+the 8192x5464 RGBA inspect frame it took 1.9 s — three times the JPEG decode
+it followed — and the inspect screenshot self-test silently fell back to
+PREVIEW because the full-res texture never arrived in time. A 128x128 tiled
+transpose with the per-row stride hoisted out of the inner loop brought it to
+~0.2-0.3 s. Rule: any new full-resolution pixel pass gets timed on a real
+45 MP frame before it ships, and a screenshot self-test that can show a
+fallback state (PREVIEW vs FULL) must be read for that chip, not just for
+"something rendered".
+
+## 2026-09-04 — Fix the frequency response before buying resolution
+The sharpness scores "barely differed" (16 frames within 2.47-2.72). The
+obvious fix was measuring at native resolution (a lossless JPEG crop at the
+tracked point). The benchmark said otherwise: the real defect was that a 3x3
+Sobel has no response at the band where a 4x-downsampled fine blur lives, so
+swapping it for a 5-point Laplacian tripled the discrimination at zero cost,
+while native-resolution measurement gave the same discrimination-to-jitter
+ratio with 3-10x the noise inflation and a decode per frame. Rule: when a
+detector looks weak, benchmark its frequency response against synthetic
+ground truth on real frames first; only buy resolution (or compute) if the
+benchmark shows the cheap formula is actually limited. Keep the benchmark in
+the repo (`examples/sharpbench.rs`) so the next change is measured too.
+
+## 2026-09-05 — Segment the pupil by growth, not by percentile
+Four rounds to a robust pupil segmentation. Fixed percentile thresholds
+(Otsu, p10-based) depend on how much of the window the pupil fills — 4% on
+an owl, 0.3% on a pale-eyed bird — so each order of thresholds fixed one bird
+and broke the other and the synthetic test. What worked: seed at the darkest
+pixel near the centre, grow the region over rising thresholds, stop before
+the first area jump measured against the blob's own perimeter, cap the
+radius at half the eye box (a size prior the camera gives us), reject
+non-solid fits (an eye-ring arc), retry from the next seed outside the
+rejected region, and check radii across the burst. Also: a fallback value
+that looks like a measurement (a nominal circle of 0.3 x window) hid the
+failures in the benchmark table for two rounds — print "no pupil", never a
+plausible-looking number, for a failed measurement.

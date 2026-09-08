@@ -26,6 +26,17 @@ pub struct PreviewInfo {
     pub is_bare_jpeg: bool,
 }
 
+/// The AF area the camera reported (Canon AFInfo2), normalized to the
+/// stored (unrotated) image: centre, size and the AF area mode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AfBox {
+    pub cx: f32,
+    pub cy: f32,
+    pub w: f32,
+    pub h: f32,
+    pub mode: u16,
+}
+
 /// Capture time with centisecond precision (EXIF SubSecTimeOriginal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Timestamp {
@@ -103,6 +114,8 @@ pub struct FileMeta {
     pub thumb: Option<PreviewInfo>,
     pub preview: Option<PreviewInfo>,
     pub fullsize: Option<PreviewInfo>,
+    /// Camera AF frame, if the MakerNote carried a subject box.
+    pub af_box: Option<AfBox>,
 }
 
 impl FileMeta {
@@ -141,6 +154,57 @@ impl FileMeta {
             thumb: None,
             preview: None,
             fullsize: None,
+            af_box: None,
+        }
+    }
+
+    /// The camera's AF frame in display orientation, only when it is small
+    /// enough to be an eye or head rather than a zone or a whole body: long
+    /// side at most 5% of the long edge, aspect at most 2.5.
+    pub fn af_box_eye(&self) -> Option<AfBox> {
+        let b = self.af_box?;
+        let long = self.width.max(self.height).max(1) as f32;
+        let (bw, bh) = (b.w * self.width as f32, b.h * self.height as f32);
+        if bw.max(bh) > 0.05 * long || bw.max(bh) > 2.5 * bw.min(bh).max(1.0) {
+            return None;
+        }
+        let (cx, cy) = crate::decode::orient_norm(b.cx, b.cy, self.orientation);
+        let swap = (5..=8).contains(&self.orientation);
+        Some(AfBox {
+            cx,
+            cy,
+            w: if swap { b.h } else { b.w },
+            h: if swap { b.w } else { b.h },
+            mode: b.mode,
+        })
+    }
+
+    /// Dimensions as displayed: EXIF orientations 5..=8 are the 90-degree
+    /// cases, so the stored width and height swap.
+    pub fn display_dims(&self) -> (u32, u32) {
+        if (5..=8).contains(&self.orientation) {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_dims_swap_for_rotated_orientations() {
+        let mut m = FileMeta::new("x.jpg".into(), 0, FileKind::Jpeg);
+        (m.width, m.height) = (8192, 5464);
+        for o in [1, 2, 3, 4] {
+            m.orientation = o;
+            assert_eq!(m.display_dims(), (8192, 5464), "orientation {o}");
+        }
+        for o in [5, 6, 7, 8] {
+            m.orientation = o;
+            assert_eq!(m.display_dims(), (5464, 8192), "orientation {o}");
         }
     }
 }

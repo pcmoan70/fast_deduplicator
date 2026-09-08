@@ -135,6 +135,25 @@ impl<'a> Tiff<'a> {
         }
     }
 
+    /// TIFF-relative offset of an offset-addressed value; None when the
+    /// value is inline (4 bytes or fewer).
+    pub fn value_offset(&self, e: &IfdEntry) -> Option<u32> {
+        (Self::type_size(e.kind) * e.count as usize > 4).then(|| self.raw_u32(&e.raw))
+    }
+
+    /// SHORT array (kind 3), inline or offset-addressed.
+    pub fn u16s(&self, e: &IfdEntry) -> Option<Vec<u16>> {
+        if e.kind != 3 {
+            return None;
+        }
+        let n = e.count as usize;
+        if n <= 2 {
+            return Some((0..n).map(|i| self.raw_u16(&[e.raw[2 * i], e.raw[2 * i + 1], 0, 0])).collect());
+        }
+        let off = self.raw_u32(&e.raw) as usize;
+        (0..n).map(|i| self.u16(off + 2 * i)).collect()
+    }
+
     pub fn ascii(&self, e: &IfdEntry) -> Option<String> {
         if e.kind != 2 {
             return None;

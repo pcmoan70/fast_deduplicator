@@ -1089,6 +1089,7 @@ name = "fd-core"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "image",
  "memchr",
  "rusqlite",
  "serde",
@@ -1108,6 +1109,7 @@ dependencies = [
  "fd-core",
  "image",
  "rfd",
+ "serde",
  "serde_json",
 ]
 

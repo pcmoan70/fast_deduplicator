@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -8,8 +8,11 @@ use eframe::egui::{
     TextureOptions, Vec2,
 };
 use fd_core::burst::{self, Burst, LogicalImage};
+use fd_core::formats::Source;
 use fd_core::meta::FileMeta;
-use fd_core::pipeline::{Engine, Event, JobKind, TrackRequest};
+use fd_core::pipeline::{Engine, Event, EyeMark, JobKind, RoiKind, TrackRequest};
+use fd_core::track::CONF_OK;
+use serde::{Deserialize, Serialize};
 use fd_core::recipe::{self, Issue, Op, PlannedAction, Recipe, Report, Severity, RECIPE_VERSION};
 
 const AUTO_PICK_N: usize = 2;
@@ -18,6 +21,11 @@ const PREVIEW_BUDGET: usize = 8;
 // Current frame + both inspect-mode neighbors (a 45 MP RGBA texture is
 // ~180 MB, so this budget is deliberately tight).
 const FULL_BUDGET: usize = 3;
+/// Upper bound for wheel zoom, relative to native pixels.
+const MAX_ZOOM: f32 = 8.0;
+/// Default focus measuring area: half-size as a fraction of the long edge
+/// (96 px on a 1620 px preview, the value the ROI score always used).
+const DEFAULT_ROI_FRAC: f32 = 96.0 / 1620.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Flag {
@@ -43,6 +51,8 @@ enum View {
 enum SortMode {
     Time,
     Sharpness,
+    /// Fraction of the focus area passing the peaking test.
+    Coverage,
 }
 
 /// Everything the user can do, from any input route. The keyboard map, the
@@ -62,6 +72,8 @@ enum Action {
     Reject,
     ClearFlag,
     Rate(u8),
+    RateUp,
+    RateDown,
     // Navigation
     OpenBurst,
     BackToOverview,
@@ -74,11 +86,16 @@ enum Action {
     AcceptTop,
     RejectAll,
     ClearTrack,
+    ToggleAfPins,
+    Unpin,
     // View
     ToggleZoom,
     ToggleInspect,
     ToggleSort,
     SetSort(SortMode),
+    SetSource(Source),
+    ToggleBrighten,
+    TogglePeaking,
     // Help
     ToggleHelp,
     ShowAbout,
@@ -101,6 +118,8 @@ impl Action {
         Action::Rate(3),
         Action::Rate(4),
         Action::Rate(5),
+        Action::RateUp,
+        Action::RateDown,
         Action::OpenBurst,
         Action::BackToOverview,
         Action::NextUnculled,
@@ -111,11 +130,18 @@ impl Action {
         Action::AcceptTop,
         Action::RejectAll,
         Action::ClearTrack,
+        Action::ToggleAfPins,
+        Action::Unpin,
         Action::ToggleZoom,
         Action::ToggleInspect,
         Action::ToggleSort,
         Action::SetSort(SortMode::Time),
         Action::SetSort(SortMode::Sharpness),
+        Action::SetSort(SortMode::Coverage),
+        Action::SetSource(Source::Embedded),
+        Action::SetSource(Source::Full),
+        Action::ToggleBrighten,
+        Action::TogglePeaking,
         Action::ToggleHelp,
         Action::ShowAbout,
     ];
@@ -133,6 +159,8 @@ impl Action {
             Action::ClearFlag => "Clear Flag".into(),
             Action::Rate(0) => "No rating".into(),
             Action::Rate(r) => "★".repeat(r as usize),
+            Action::RateUp => "One More Star".into(),
+            Action::RateDown => "One Star Less".into(),
             Action::OpenBurst => "Open Burst".into(),
             Action::BackToOverview => "Back to Overview".into(),
             Action::NextUnculled => "Next Unculled Burst".into(),
@@ -142,12 +170,19 @@ impl Action {
             Action::NavDown => "Next Burst".into(),
             Action::AcceptTop => format!("Accept Top {AUTO_PICK_N} + Reject Rest"),
             Action::RejectAll => "Reject All Frames".into(),
-            Action::ClearTrack => "Clear Tracking Point".into(),
+            Action::ClearTrack => "Clear Pins".into(),
+            Action::ToggleAfPins => "Use Camera Eye Points".into(),
+            Action::Unpin => "Unpin This Frame".into(),
             Action::ToggleZoom => "Zoom 100%".into(),
             Action::ToggleInspect => "Inspect Focus Point".into(),
             Action::ToggleSort => "Toggle Sort Order".into(),
             Action::SetSort(SortMode::Time) => "Sort by Capture Time".into(),
             Action::SetSort(SortMode::Sharpness) => "Sort by Sharpness".into(),
+            Action::SetSort(SortMode::Coverage) => "Sort by Focus Coverage".into(),
+            Action::SetSource(Source::Embedded) => "Source: Embedded Preview".into(),
+            Action::SetSource(Source::Full) => "Source: Full Image".into(),
+            Action::ToggleBrighten => "Auto-brighten Dark Images".into(),
+            Action::TogglePeaking => "Focus Peaking".into(),
             Action::ToggleHelp => "Keyboard Shortcuts".into(),
             Action::ShowAbout => "About".into(),
         }
@@ -170,56 +205,83 @@ impl Action {
             Action::Rate(3) => "3",
             Action::Rate(4) => "4",
             Action::Rate(5) => "5",
+            Action::RateUp => "+",
+            Action::RateDown => "-",
             Action::OpenBurst => "Enter",
             Action::BackToOverview => "Esc",
             Action::NextUnculled => "N",
             Action::NavLeft => "Left",
             Action::NavRight => "Right",
-            Action::NavUp => "Up",
-            Action::NavDown => "Down",
+            Action::NavUp => "Up / Shift+Left",
+            Action::NavDown => "Down / Shift+Right",
             Action::AcceptTop => "Ctrl+Enter",
             Action::RejectAll => "Ctrl+X",
             Action::ToggleZoom => "Z",
             Action::ToggleInspect => "I",
+            Action::ToggleBrighten => "B",
+            Action::TogglePeaking => "K",
+            Action::Unpin => "Backspace",
             Action::ToggleSort | Action::SetSort(_) => "O",
             Action::ToggleHelp => "?",
-            Action::OpenRecipe | Action::ClearTrack | Action::ShowAbout | Action::Rate(_) => "",
+            Action::OpenRecipe
+            | Action::ClearTrack
+            | Action::ShowAbout
+            | Action::Rate(_)
+            | Action::SetSource(_)
+            | Action::ToggleAfPins => "",
         }
     }
+}
+
+/// Modifier a binding needs. `None` bindings ignore Shift (so `?` still
+/// works on layouts where it is Shift+/) unless the same key also has a
+/// Shift binding.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mods {
+    None,
+    Ctrl,
+    Shift,
 }
 
 /// The keyboard bindings, as data so they can be checked for collisions.
 /// Context-sensitive meaning (an arrow moves the grid cursor in Overview and
 /// the frame in Burst) lives in `perform`, not here.
-const KEYMAP: &[(Key, bool, Action)] = &[
-    (Key::O, true, Action::OpenFolder),
-    (Key::H, true, Action::Harvest),
-    (Key::S, true, Action::SaveSession),
-    (Key::Q, true, Action::Quit),
-    (Key::Z, true, Action::Undo),
-    (Key::X, true, Action::RejectAll),
-    (Key::Enter, true, Action::AcceptTop),
-    (Key::Enter, false, Action::OpenBurst),
-    (Key::Escape, false, Action::BackToOverview),
-    (Key::N, false, Action::NextUnculled),
-    (Key::P, false, Action::Pick),
-    (Key::X, false, Action::Reject),
-    (Key::U, false, Action::ClearFlag),
-    (Key::Z, false, Action::ToggleZoom),
-    (Key::I, false, Action::ToggleInspect),
-    (Key::O, false, Action::ToggleSort),
-    (Key::H, false, Action::ToggleHelp),
-    (Key::Questionmark, false, Action::ToggleHelp),
-    (Key::ArrowLeft, false, Action::NavLeft),
-    (Key::ArrowRight, false, Action::NavRight),
-    (Key::ArrowUp, false, Action::NavUp),
-    (Key::ArrowDown, false, Action::NavDown),
-    (Key::Num0, false, Action::Rate(0)),
-    (Key::Num1, false, Action::Rate(1)),
-    (Key::Num2, false, Action::Rate(2)),
-    (Key::Num3, false, Action::Rate(3)),
-    (Key::Num4, false, Action::Rate(4)),
-    (Key::Num5, false, Action::Rate(5)),
+const KEYMAP: &[(Key, Mods, Action)] = &[
+    (Key::O, Mods::Ctrl, Action::OpenFolder),
+    (Key::H, Mods::Ctrl, Action::Harvest),
+    (Key::S, Mods::Ctrl, Action::SaveSession),
+    (Key::Q, Mods::Ctrl, Action::Quit),
+    (Key::Z, Mods::Ctrl, Action::Undo),
+    (Key::X, Mods::Ctrl, Action::RejectAll),
+    (Key::Enter, Mods::Ctrl, Action::AcceptTop),
+    (Key::Enter, Mods::None, Action::OpenBurst),
+    (Key::Escape, Mods::None, Action::BackToOverview),
+    (Key::N, Mods::None, Action::NextUnculled),
+    (Key::P, Mods::None, Action::Pick),
+    (Key::X, Mods::None, Action::Reject),
+    (Key::U, Mods::None, Action::ClearFlag),
+    (Key::Z, Mods::None, Action::ToggleZoom),
+    (Key::I, Mods::None, Action::ToggleInspect),
+    (Key::B, Mods::None, Action::ToggleBrighten),
+    (Key::K, Mods::None, Action::TogglePeaking),
+    (Key::O, Mods::None, Action::ToggleSort),
+    (Key::H, Mods::None, Action::ToggleHelp),
+    (Key::Questionmark, Mods::None, Action::ToggleHelp),
+    (Key::ArrowLeft, Mods::None, Action::NavLeft),
+    (Key::ArrowRight, Mods::None, Action::NavRight),
+    (Key::ArrowUp, Mods::None, Action::NavUp),
+    (Key::ArrowDown, Mods::None, Action::NavDown),
+    (Key::Backspace, Mods::None, Action::Unpin),
+    (Key::ArrowLeft, Mods::Shift, Action::NavUp),
+    (Key::ArrowRight, Mods::Shift, Action::NavDown),
+    (Key::Num0, Mods::None, Action::Rate(0)),
+    (Key::Num1, Mods::None, Action::Rate(1)),
+    (Key::Num2, Mods::None, Action::Rate(2)),
+    (Key::Num3, Mods::None, Action::Rate(3)),
+    (Key::Num4, Mods::None, Action::Rate(4)),
+    (Key::Num5, Mods::None, Action::Rate(5)),
+    (Key::Plus, Mods::None, Action::RateUp),
+    (Key::Minus, Mods::None, Action::RateDown),
 ];
 
 /// A pending action that needs confirmation before it runs.
@@ -237,13 +299,21 @@ struct Tex {
 #[derive(Default)]
 struct RoiTrack {
     req_id: u64,
+    /// The user's pins, (meta idx, x, y): every frame follows its nearest
+    /// pin. Kept so the track can be re-run when the measuring area changes.
+    seeds: Vec<(usize, f32, f32)>,
     /// meta idx -> (x, y, confidence), normalized coordinates.
     points: HashMap<usize, (f32, f32, f32)>,
-    /// meta idx -> sharpness at the tracked point.
+    /// meta idx -> sharpness at the tracked point (working-res patch).
     roi_scores: HashMap<usize, f32>,
+    /// meta idx -> native-res pupil measurement; `points` then holds the
+    /// pupil centre.
+    eyes: HashMap<usize, (RoiKind, EyeMark)>,
+    /// meta idx -> fraction of the focus area passing the peaking test.
+    coverage: HashMap<usize, f32>,
+    /// Every frame measured: rank by eye widths from now on.
+    done: bool,
 }
-
-const CONF_OK: f32 = 0.55;
 
 /// Which rows the review table shows.
 #[derive(Clone, Copy, PartialEq)]
@@ -285,7 +355,10 @@ enum HarvestPhase {
 
 struct HarvestUi {
     open: bool,
-    do_xmp: bool,
+    /// XMP rating sidecar next to each copy (the default place for ratings).
+    xmp_with_copies: bool,
+    /// XMP sidecars next to the originals: opt-in, it touches the source folder.
+    xmp_in_place: bool,
     do_copy: bool,
     dest: String,
     phase: HarvestPhase,
@@ -295,17 +368,49 @@ struct HarvestUi {
 }
 
 impl HarvestUi {
-    fn new() -> HarvestUi {
+    /// Defaults: copy picks to a `<folder>_keepers` sibling (never inside the
+    /// card folder, which would be rescanned as images), ratings next to the
+    /// copies, nothing written next to the originals.
+    fn for_dir(dir: &std::path::Path) -> HarvestUi {
+        let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "photos".into());
+        let dest = dir.parent().unwrap_or(dir).join(format!("{name}_keepers"));
         HarvestUi {
             open: false,
-            do_xmp: true,
-            do_copy: false,
-            dest: String::new(),
+            xmp_with_copies: true,
+            xmp_in_place: false,
+            do_copy: true,
+            dest: dest.display().to_string(),
             phase: HarvestPhase::Configure,
             progress: None,
             status: String::new(),
         }
     }
+}
+
+/// Non-destructive record of the culling session, `fd-session.json` in the
+/// image folder: flags, ratings and manual focus pins by file name. It is the
+/// only thing the app ever writes into that folder.
+#[derive(Serialize, Deserialize, Default, PartialEq, Debug)]
+struct SessionFile {
+    version: u32,
+    #[serde(default)]
+    images: BTreeMap<String, SessionImage>,
+    /// Manual focus pins: file -> normalized (x, y) in the upright image.
+    #[serde(default)]
+    pins: BTreeMap<String, (f32, f32)>,
+}
+
+#[derive(Serialize, Deserialize, Default, PartialEq, Debug)]
+struct SessionImage {
+    /// "pick", "reject" or absent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    flag: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    rating: u8,
+}
+
+fn is_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 enum HarvestMsg {
@@ -330,7 +435,28 @@ pub struct App {
     view: View,
     overview_cursor: usize,
     sort: SortMode,
-    zoom_100: bool,
+    /// What previews, scores and tracks are computed from.
+    source: Source,
+    /// Magnification relative to native pixels; None = fit to window.
+    zoom: Option<f32>,
+    /// Focus measuring area half-size, fraction of the long edge (Shift+wheel).
+    roi_frac: f32,
+    /// Display-only auto brighten (View menu, key B).
+    brighten: bool,
+    /// Display-only focus peaking overlay (View menu, key K).
+    peaking: bool,
+    /// Use the camera's eye-AF frames as focus points (Burst menu).
+    use_af: bool,
+    /// Pins read from the session file, applied when their burst is opened.
+    pending_pins: HashMap<usize, (f32, f32)>,
+    /// Contact-sheet thumbnail size, 1.0 = 160 px cells (Shift+wheel).
+    thumb_scale: f32,
+    /// Requested UI zoom (--ui-zoom); None = follow the monitor.
+    ui_zoom: Option<f32>,
+    /// Last zoom this app applied, to notice a manual Ctrl+Plus/Minus.
+    auto_zoom: Option<f32>,
+    /// (last estimated monitor height in px, frames it has held steady).
+    zoom_est: (f32, u32),
     /// Inspection mode: full-res JPEG at 1:1, auto-centered on the tracked
     /// focus point of each frame (image center when no track exists).
     inspect: bool,
@@ -363,7 +489,7 @@ pub struct App {
 
 impl App {
     pub fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         dir: PathBuf,
         screenshot: Option<PathBuf>,
         shot_frames: u64,
@@ -372,11 +498,27 @@ impl App {
         build_recipe_to: Option<PathBuf>,
         open_harvest: bool,
         start_inspect: bool,
+        source: Source,
+        brighten: bool,
+        peaking: bool,
+        ui_zoom: Option<f32>,
     ) -> Self {
+        // Larger base type and roomier buttons than egui's defaults; the
+        // screen-derived zoom in `update` scales on top of this.
+        cc.egui_ctx.style_mut(|s| {
+            for font in s.text_styles.values_mut() {
+                font.size *= 1.15;
+            }
+            s.spacing.button_padding = Vec2::new(8.0, 4.0);
+            s.spacing.item_spacing.x = 8.0;
+        });
         let workers = std::thread::available_parallelism()
             .map(|v| v.get().saturating_sub(2).max(2))
             .unwrap_or(4);
-        let engine = Engine::start(dir.clone(), dir.join(".fd-cache.db"), workers);
+        let engine = Engine::start(dir.clone(), dir.join(".fd-cache.db"), workers, source);
+        engine.set_brighten(brighten);
+        engine.set_peaking(peaking);
+        let harvest = HarvestUi::for_dir(&dir);
         App {
             dir,
             engine,
@@ -392,7 +534,17 @@ impl App {
             view: View::Overview,
             overview_cursor: 0,
             sort: SortMode::Sharpness,
-            zoom_100: false,
+            source,
+            zoom: None,
+            roi_frac: DEFAULT_ROI_FRAC,
+            brighten,
+            peaking,
+            use_af: true,
+            pending_pins: HashMap::new(),
+            thumb_scale: 1.0,
+            ui_zoom,
+            auto_zoom: None,
+            zoom_est: (0.0, 0),
             inspect: false,
             pan: Vec2::ZERO,
             textures: HashMap::new(),
@@ -401,7 +553,7 @@ impl App {
             scan_done: false,
             scan_started: Instant::now(),
             scores_expected: 0,
-            harvest: HarvestUi::new(),
+            harvest,
             show_help: false,
             show_about: false,
             confirm: None,
@@ -483,12 +635,33 @@ impl App {
                     y,
                     conf,
                     roi_score,
+                    coverage,
                 } => {
                     if let Some(&b) = self.track_burst.get(&req_id) {
                         let entry = self.roi.entry(b).or_default();
                         if entry.req_id == req_id {
                             entry.points.insert(idx, (x, y, conf));
                             entry.roi_scores.insert(idx, roi_score);
+                            entry.coverage.insert(idx, coverage);
+                        }
+                    }
+                }
+                Event::EyePoint { req_id, idx, x, y, kind, eye } => {
+                    if let Some(&b) = self.track_burst.get(&req_id) {
+                        let entry = self.roi.entry(b).or_default();
+                        if entry.req_id == req_id {
+                            let conf = entry.points.get(&idx).map(|p| p.2).unwrap_or(1.0);
+                            entry.points.insert(idx, (x, y, conf));
+                            entry.eyes.insert(idx, (kind, eye));
+                        }
+                    }
+                }
+                Event::TrackDone { req_id } => {
+                    if let Some(&b) = self.track_burst.get(&req_id) {
+                        if let Some(t) = self.roi.get_mut(&b) {
+                            if t.req_id == req_id {
+                                t.done = true;
+                            }
                         }
                     }
                 }
@@ -575,6 +748,20 @@ impl App {
     /// frames always outrank lost/untracked ones), else global sharpness.
     fn effective_score(&self, b: usize, id: usize) -> (bool, f32) {
         if let Some(t) = self.roi.get(&b) {
+            if self.sort == SortMode::Coverage {
+                if let (Some(&(_, _, conf)), Some(&c)) = (t.points.get(&id), t.coverage.get(&id)) {
+                    return (conf >= CONF_OK, if conf >= CONF_OK { c } else { self.scores.get(&id).copied().unwrap_or(0.0) });
+                }
+            }
+            // Once every frame is measured, rank by pupil edge width (lower =
+            // sharper); frames without a pupil drop to the lower tier so a
+            // width is never sorted against a patch score.
+            if t.done {
+                return match t.eyes.get(&id) {
+                    Some((_, e)) => (true, 100.0 / e.width_px.max(0.1)),
+                    None => (false, self.scores.get(&id).copied().unwrap_or(0.0)),
+                };
+            }
             if let (Some(&(_, _, conf)), Some(&rs)) =
                 (t.points.get(&id), t.roi_scores.get(&id))
             {
@@ -603,7 +790,7 @@ impl App {
     /// Frame display order for a burst under the current sort mode.
     fn order(&self, b: usize) -> Vec<usize> {
         let mut idxs: Vec<usize> = (0..self.bursts[b].images.len()).collect();
-        if self.sort == SortMode::Sharpness {
+        if self.sort != SortMode::Time {
             self.rank_by_score(b, &mut idxs);
         }
         idxs
@@ -638,28 +825,51 @@ impl App {
     // ---------- session persistence ----------
 
     fn session_path(&self) -> PathBuf {
-        self.dir.join(".fd-session.tsv")
+        self.dir.join("fd-session.json")
+    }
+
+    fn rel_key(&self, id: usize) -> String {
+        self.rel_path(id).to_string_lossy().to_string()
     }
 
     fn load_session(&mut self) {
-        let Ok(text) = std::fs::read_to_string(self.session_path()) else {
+        let by_rel: HashMap<String, usize> =
+            self.images.iter().map(|li| (self.rel_key(li.primary()), li.primary())).collect();
+        if let Ok(text) = std::fs::read_to_string(self.session_path()) {
+            let Ok(file) = serde_json::from_str::<SessionFile>(&text) else {
+                return;
+            };
+            for (name, img) in file.images {
+                if let Some(&id) = by_rel.get(&name) {
+                    let flag = match img.flag.as_str() {
+                        "pick" => Flag::Picked,
+                        "reject" => Flag::Rejected,
+                        _ => Flag::Unrated,
+                    };
+                    if flag != Flag::Unrated || img.rating > 0 {
+                        self.state.insert(id, ImgState { flag, rating: img.rating });
+                    }
+                }
+            }
+            for (name, pin) in file.pins {
+                if let Some(&id) = by_rel.get(&name) {
+                    self.pending_pins.insert(id, pin);
+                }
+            }
+            return;
+        }
+        // Migrate the pre-JSON tab-separated session once (absolute paths).
+        let Ok(text) = std::fs::read_to_string(self.dir.join(".fd-session.tsv")) else {
             return;
         };
         let by_path: HashMap<&str, usize> = self
             .images
             .iter()
-            .map(|li| {
-                (
-                    self.metas[li.primary()].path.to_str().unwrap_or(""),
-                    li.primary(),
-                )
-            })
+            .map(|li| (self.metas[li.primary()].path.to_str().unwrap_or(""), li.primary()))
             .collect();
         for line in text.lines() {
             let mut parts = line.split('\t');
-            let (Some(path), Some(flag), Some(rating)) =
-                (parts.next(), parts.next(), parts.next())
-            else {
+            let (Some(path), Some(flag), Some(rating)) = (parts.next(), parts.next(), parts.next()) else {
                 continue;
             };
             if let Some(&id) = by_path.get(path) {
@@ -674,21 +884,33 @@ impl App {
                 }
             }
         }
+        // Rewritten as fd-session.json on the next autosave.
+        self.session_dirty = !self.state.is_empty();
     }
 
     fn save_session(&mut self) {
-        let mut out = String::new();
+        let mut file = SessionFile { version: 1, ..Default::default() };
         for (&id, st) in &self.state {
+            if self.metas.get(id).is_none() {
+                continue;
+            }
             let flag = match st.flag {
-                Flag::Picked => "P",
-                Flag::Rejected => "X",
-                Flag::Unrated => "U",
+                Flag::Picked => "pick",
+                Flag::Rejected => "reject",
+                Flag::Unrated => "",
             };
-            if let Some(p) = self.metas.get(id).and_then(|m| m.path.to_str()) {
-                out.push_str(&format!("{p}\t{flag}\t{}\n", st.rating));
+            file.images.insert(self.rel_key(id), SessionImage { flag: flag.into(), rating: st.rating });
+        }
+        for t in self.roi.values() {
+            for &(id, x, y) in &t.seeds {
+                if self.metas.get(id).is_some() {
+                    file.pins.insert(self.rel_key(id), (x, y));
+                }
             }
         }
-        let _ = std::fs::write(self.session_path(), out);
+        if let Ok(json) = serde_json::to_string_pretty(&file) {
+            let _ = std::fs::write(self.session_path(), json);
+        }
         self.session_dirty = false;
         self.last_save = Instant::now();
     }
@@ -700,11 +922,20 @@ impl App {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let ctrl = ctx.input(|i| i.modifiers.command);
+        let (ctrl, shift) = ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
+        let has_shift_binding =
+            |key: &Key| KEYMAP.iter().any(|(k, m, _)| k == key && *m == Mods::Shift);
         let hits: Vec<Action> = ctx.input(|i| {
             KEYMAP
                 .iter()
-                .filter(|(key, needs_ctrl, _)| *needs_ctrl == ctrl && i.key_pressed(*key))
+                .filter(|(key, mods, _)| {
+                    i.key_pressed(*key)
+                        && match mods {
+                            Mods::Ctrl => ctrl,
+                            Mods::Shift => shift && !ctrl,
+                            Mods::None => !ctrl && !(shift && has_shift_binding(key)),
+                        }
+                })
                 .map(|(_, _, action)| *action)
                 .collect()
         });
@@ -724,16 +955,15 @@ impl App {
         order.get(frame).map(|&fi| self.bursts[b].images[fi].primary())
     }
 
+    /// Move within a burst. Zoom and pan are kept on purpose: every frame of
+    /// a burst has the same dimensions, so the same offset shows the same spot,
+    /// which is what makes flipping between zoomed frames comparable.
     fn goto_frame(&mut self, b: usize, frame: usize) {
         let nf = self.bursts[b].images.len();
         if nf == 0 {
             return;
         }
-        let frame = frame.min(nf - 1);
-        if self.view != (View::Burst { b, frame }) {
-            self.pan = Vec2::ZERO;
-        }
-        self.view = View::Burst { b, frame };
+        self.view = View::Burst { b, frame: frame.min(nf - 1) };
     }
 
     /// Flag the current frame; picks and rejects auto-advance, clearing does not.
@@ -778,11 +1008,20 @@ impl App {
             | Action::ToggleHelp
             | Action::ShowAbout
             | Action::ToggleSort
-            | Action::SetSort(_) => true,
+            | Action::SetSort(_)
+            | Action::SetSource(_)
+            | Action::ToggleBrighten
+            | Action::TogglePeaking
+            | Action::ToggleAfPins => true,
             Action::SaveSession => !self.state.is_empty(),
             Action::Harvest => has_bursts,
             Action::Undo => !self.undo.is_empty(),
-            Action::Pick | Action::Reject | Action::ClearFlag | Action::Rate(_) => in_burst,
+            Action::Pick
+            | Action::Reject
+            | Action::ClearFlag
+            | Action::Rate(_)
+            | Action::RateUp
+            | Action::RateDown => in_burst,
             Action::OpenBurst => has_bursts && !in_burst,
             Action::BackToOverview => in_burst,
             Action::NextUnculled => has_bursts,
@@ -794,6 +1033,10 @@ impl App {
             Action::ClearTrack => match self.view {
                 View::Burst { b, .. } => self.roi.contains_key(&b),
                 View::Overview => false,
+            },
+            Action::Unpin => match (self.view, self.current_id()) {
+                (View::Burst { b, .. }, Some(id)) => self.is_pinned(b, id),
+                _ => false,
             },
         }
     }
@@ -825,6 +1068,14 @@ impl App {
                     self.apply(vec![(id, st)]);
                 }
             }
+            // Step the rating without wrapping: + stays at 5, - stays at 0.
+            Action::RateUp | Action::RateDown => {
+                if let Some(id) = self.current_id() {
+                    let mut st = self.img_state(id);
+                    st.rating = if a == Action::RateUp { (st.rating + 1).min(5) } else { st.rating.saturating_sub(1) };
+                    self.apply(vec![(id, st)]);
+                }
+            }
             Action::OpenBurst => {
                 if !self.bursts.is_empty() {
                     let b = self.overview_cursor.min(self.bursts.len() - 1);
@@ -835,7 +1086,7 @@ impl App {
                 if let View::Burst { b, .. } = self.view {
                     self.overview_cursor = b;
                     self.view = View::Overview;
-                    self.zoom_100 = false;
+                    self.zoom = None;
                     self.inspect = false;
                 }
             }
@@ -902,28 +1153,71 @@ impl App {
                     self.confirm = Some(Confirm::RejectAll { b });
                 }
             }
+            // Drops the user's pins; the camera's eye points come back on their own.
             Action::ClearTrack => {
                 if let View::Burst { b, .. } = self.view {
                     self.roi.remove(&b);
+                    self.session_dirty = true;
+                    self.auto_track(b);
+                }
+            }
+            Action::Unpin => {
+                if let (View::Burst { b, .. }, Some(id)) = (self.view, self.current_id()) {
+                    self.unpin(b, id);
+                }
+            }
+            // For bursts where Eye-AF locked onto the wrong thing throughout.
+            Action::ToggleAfPins => {
+                self.use_af = !self.use_af;
+                if let View::Burst { b, .. } = self.view {
+                    let seeds = self.roi.get(&b).map(|t| t.seeds.clone()).unwrap_or_default();
+                    if seeds.is_empty() && !self.use_af {
+                        self.roi.remove(&b);
+                    } else {
+                        self.run_track(b, seeds);
+                    }
                 }
             }
             Action::ToggleZoom => {
-                self.zoom_100 = !self.zoom_100;
+                self.zoom = if self.zoom.is_some() { None } else { Some(1.0) };
                 self.inspect = false;
                 self.pan = Vec2::ZERO;
             }
             Action::ToggleInspect => {
                 self.inspect = !self.inspect;
-                self.zoom_100 = false;
+                self.zoom = None;
                 self.pan = Vec2::ZERO;
             }
             Action::ToggleSort => {
                 self.sort = match self.sort {
                     SortMode::Time => SortMode::Sharpness,
-                    SortMode::Sharpness => SortMode::Time,
+                    SortMode::Sharpness => SortMode::Coverage,
+                    SortMode::Coverage => SortMode::Time,
                 }
             }
             Action::SetSort(m) => self.sort = m,
+            // Previews, scores and tracks all derive from the source, so the
+            // folder is reopened with a fresh engine (flags are autosaved).
+            Action::SetSource(s) => {
+                if self.source != s {
+                    self.source = s;
+                    self.open_dir(self.dir.clone());
+                }
+            }
+            // Display only: re-decode what is on screen with the new setting.
+            Action::ToggleBrighten => {
+                self.brighten = !self.brighten;
+                self.engine.set_brighten(self.brighten);
+                self.textures.clear();
+                self.requested.clear();
+            }
+            // Display only: paint the pixels the coverage score counts.
+            Action::TogglePeaking => {
+                self.peaking = !self.peaking;
+                self.engine.set_peaking(self.peaking);
+                self.textures.clear();
+                self.requested.clear();
+            }
             Action::ToggleHelp => self.show_help = !self.show_help,
             Action::ShowAbout => self.show_about = true,
         }
@@ -939,7 +1233,9 @@ impl App {
         let workers = std::thread::available_parallelism()
             .map(|v| v.get().saturating_sub(2).max(2))
             .unwrap_or(4);
-        self.engine = Engine::start(dir.clone(), dir.join(".fd-cache.db"), workers);
+        self.engine = Engine::start(dir.clone(), dir.join(".fd-cache.db"), workers, self.source);
+        self.engine.set_brighten(self.brighten);
+        self.engine.set_peaking(self.peaking);
         self.dir = dir;
         self.metas.clear();
         self.images.clear();
@@ -953,17 +1249,28 @@ impl App {
         self.requested.clear();
         self.view = View::Overview;
         self.overview_cursor = 0;
-        self.zoom_100 = false;
+        self.zoom = None;
         self.inspect = false;
         self.pan = Vec2::ZERO;
         self.scan_done = false;
         self.scan_started = Instant::now();
         self.scores_expected = 0;
         self.session_dirty = false;
-        self.harvest = HarvestUi::new();
+        self.pending_pins.clear();
+        self.harvest = HarvestUi::for_dir(&self.dir);
     }
 
+    /// Pin the focus point on `seed_id` (replacing an earlier pin on that
+    /// frame) and re-run the burst's track from all its pins.
     fn start_track(&mut self, b: usize, seed_id: usize, nx: f32, ny: f32) {
+        let mut seeds = self.roi.get(&b).map(|t| t.seeds.clone()).unwrap_or_default();
+        seeds.retain(|s| s.0 != seed_id);
+        seeds.push((seed_id, nx, ny));
+        self.run_track(b, seeds);
+    }
+
+    /// (Re)start the burst's track from the given pins.
+    fn run_track(&mut self, b: usize, seeds: Vec<(usize, f32, f32)>) {
         self.next_track_id += 1;
         let req_id = self.next_track_id;
         let frames: Vec<usize> = self.bursts[b].images.iter().map(|li| li.primary()).collect();
@@ -972,29 +1279,108 @@ impl App {
             b,
             RoiTrack {
                 req_id,
+                seeds: seeds.clone(),
                 points: HashMap::new(),
                 roi_scores: HashMap::new(),
+                eyes: HashMap::new(),
+                coverage: HashMap::new(),
+                done: false,
             },
         );
         self.engine.request_track(TrackRequest {
             req_id,
             frames,
-            seed_frame: seed_id,
-            seed_x: nx,
-            seed_y: ny,
+            seeds,
+            roi_frac: self.roi_frac,
+            use_af: self.use_af,
         });
+        self.session_dirty = true;
     }
 
+    /// Cancel the manual override on one frame: it goes back to the camera's
+    /// eye point (or to tracking from the remaining pins).
+    fn unpin(&mut self, b: usize, id: usize) {
+        let mut seeds = self.roi.get(&b).map(|t| t.seeds.clone()).unwrap_or_default();
+        seeds.retain(|s| s.0 != id);
+        let has_eye = self.bursts[b].images.iter().any(|li| self.metas[li.primary()].af_box_eye().is_some());
+        if seeds.is_empty() && !(self.use_af && has_eye) {
+            self.roi.remove(&b);
+            self.session_dirty = true;
+        } else {
+            self.run_track(b, seeds);
+        }
+    }
+
+    /// Start the burst's track from the camera's eye frames alone, if it has
+    /// any and no track exists yet.
+    fn auto_track(&mut self, b: usize) {
+        if self.roi.contains_key(&b) {
+            return;
+        }
+        let ids: Vec<usize> = self.bursts[b].images.iter().map(|li| li.primary()).collect();
+        // Pins saved in the session come back first.
+        let seeds: Vec<(usize, f32, f32)> =
+            ids.iter().filter_map(|&id| self.pending_pins.remove(&id).map(|(x, y)| (id, x, y))).collect();
+        let has_eye = ids.iter().any(|&id| self.metas[id].af_box_eye().is_some());
+        if !seeds.is_empty() || (self.use_af && has_eye) {
+            self.run_track(b, seeds);
+        }
+    }
+
+    fn is_pinned(&self, b: usize, id: usize) -> bool {
+        self.roi
+            .get(&b)
+            .is_some_and(|t| t.seeds.iter().any(|s| s.0 == id))
+    }
+
+    /// Resize the focus measuring area and re-run the burst's track (if any)
+    /// so its ROI scores use the new size.
+    fn set_roi_frac(&mut self, b: usize, frac: f32) {
+        self.roi_frac = frac.clamp(0.01, 0.4);
+        if let Some(seeds) = self.roi.get(&b).map(|t| t.seeds.clone()) {
+            self.run_track(b, seeds);
+        }
+    }
+
+    /// Wheel zoom about `cursor`: the image point under it stays put. Zooming
+    /// out past the fit scale drops back to fit (inspect keeps its anchor).
+    fn wheel_zoom(
+        &mut self,
+        cursor: egui::Pos2,
+        img_rect: Rect,
+        main_rect: Rect,
+        dims: Vec2,
+        anchor: Vec2,
+        factor: f32,
+    ) {
+        let fit = (main_rect.width() / dims.x)
+            .min(main_rect.height() / dims.y)
+            .min(4.0);
+        let cur = img_rect.width() / dims.x;
+        let new = (cur * factor).clamp(fit, MAX_ZOOM);
+        if new <= fit * 1.001 && !self.inspect {
+            self.zoom = None;
+            self.pan = Vec2::ZERO;
+            return;
+        }
+        let u = (cursor - img_rect.min) / img_rect.size();
+        let size = dims * new;
+        self.pan = (cursor - main_rect.center()) - Vec2::new(u.x * size.x, u.y * size.y)
+            + Vec2::new(anchor.x * size.x, anchor.y * size.y);
+        self.zoom = Some(new);
+    }
+
+    /// Open a burst. The zoom level and inspect mode carry over so a zoomed
+    /// comparison continues in the next sequence; the pan recenters.
     fn enter_burst(&mut self, b: usize) {
         self.view = View::Burst { b, frame: 0 };
-        self.zoom_100 = false;
-        self.inspect = false;
         self.pan = Vec2::ZERO;
+        self.auto_track(b);
     }
 
     fn overview_cols(&self, ctx: &egui::Context) -> usize {
         let w = ctx.screen_rect().width() - 24.0;
-        ((w / 176.0).floor() as usize).max(1)
+        ((w / (176.0 * self.thumb_scale)).floor() as usize).max(1)
     }
 
     // ---------- drawing ----------
@@ -1053,6 +1439,12 @@ impl App {
                             fired = Some(a);
                         }
                     }
+                    ui.separator();
+                    for a in [Action::RateUp, Action::RateDown] {
+                        if self.menu_item(ui, a, None) {
+                            fired = Some(a);
+                        }
+                    }
                 });
             });
             ui.menu_button("View", |ui| {
@@ -1062,18 +1454,32 @@ impl App {
                     }
                 }
                 ui.separator();
-                for m in [SortMode::Time, SortMode::Sharpness] {
+                for m in [SortMode::Time, SortMode::Sharpness, SortMode::Coverage] {
                     let a = Action::SetSort(m);
                     if self.menu_item(ui, a, Some(self.sort == m)) {
                         fired = Some(a);
                     }
                 }
                 ui.separator();
-                if self.menu_item(ui, Action::ToggleZoom, Some(self.zoom_100)) {
+                for s in [Source::Embedded, Source::Full] {
+                    let a = Action::SetSource(s);
+                    if self.menu_item(ui, a, Some(self.source == s)) {
+                        fired = Some(a);
+                    }
+                }
+                ui.separator();
+                if self.menu_item(ui, Action::ToggleZoom, Some(self.zoom.is_some())) {
                     fired = Some(Action::ToggleZoom);
                 }
                 if self.menu_item(ui, Action::ToggleInspect, Some(self.inspect)) {
                     fired = Some(Action::ToggleInspect);
+                }
+                ui.separator();
+                if self.menu_item(ui, Action::ToggleBrighten, Some(self.brighten)) {
+                    fired = Some(Action::ToggleBrighten);
+                }
+                if self.menu_item(ui, Action::TogglePeaking, Some(self.peaking)) {
+                    fired = Some(Action::TogglePeaking);
                 }
             });
             ui.menu_button("Burst", |ui| {
@@ -1085,6 +1491,12 @@ impl App {
                 ui.separator();
                 if self.menu_item(ui, Action::ClearTrack, None) {
                     fired = Some(Action::ClearTrack);
+                }
+                if self.menu_item(ui, Action::ToggleAfPins, Some(self.use_af)) {
+                    fired = Some(Action::ToggleAfPins);
+                }
+                if self.menu_item(ui, Action::Unpin, None) {
+                    fired = Some(Action::Unpin);
                 }
             });
             ui.menu_button("Help", |ui| {
@@ -1185,17 +1597,43 @@ impl App {
                             } else {
                                 Color32::from_rgb(220, 70, 70)
                             };
-                            ui.colored_label(col, format!("Tracking {conf:.2}"));
-                            if self.tool_button(ui, Action::ClearTrack, "Clear track") {
+                            let pinned = self.current_id().is_some_and(|id| self.is_pinned(b, id));
+                            let pin = if pinned { " · pinned" } else { "" };
+                            let t = self.roi.get(&b);
+                            let eye = self.current_id().and_then(|id| t.and_then(|t| t.eyes.get(&id)).copied());
+                            // Eyelids clip part of the rim, so sharp eyes reach ~1.5; motion blur is 2+.
+                            let motion = |e: &EyeMark| if e.anisotropy > 1.6 { " · motion" } else { "" };
+                            let cov = self
+                                .current_id()
+                                .and_then(|id| t.and_then(|t| t.coverage.get(&id)))
+                                .map(|c| format!(" · {:.0}% in focus", 100.0 * c))
+                                .unwrap_or_default();
+                            let text = match eye {
+                                Some((RoiKind::EyeCamera, e)) => format!("Eye (camera) · {:.1} px{cov}{}{pin}", e.width_px, motion(&e)),
+                                Some((RoiKind::EyeTracked, e)) => format!("Eye (tracked) {conf:.2} · {:.1} px{cov}{}{pin}", e.width_px, motion(&e)),
+                                None if !t.is_some_and(|t| t.done) => format!("Tracking {conf:.2}{cov}{pin} · measuring…"),
+                                None => format!("Area {conf:.2}{cov}{pin} (no pupil found)"),
+                            };
+                            ui.colored_label(col, text);
+                            if pinned && self.tool_button(ui, Action::Unpin, "Unpin") {
+                                fired = Some(Action::Unpin);
+                            }
+                            ui.weak(format!("area {:.0}% (Shift+wheel)", 200.0 * self.roi_frac));
+                            if self.tool_button(ui, Action::ClearTrack, "Clear pins") {
                                 fired = Some(Action::ClearTrack);
                             }
                         }
                         None if self.roi.contains_key(&b) => {
-                            ui.colored_label(
-                                Color32::from_rgb(220, 70, 70),
-                                "Track lost on this frame",
-                            );
-                            if self.tool_button(ui, Action::ClearTrack, "Clear track") {
+                            if self.engine.busy() > 0 {
+                                ui.spinner();
+                                ui.weak("tracking…");
+                            } else {
+                                ui.colored_label(
+                                    Color32::from_rgb(220, 70, 70),
+                                    "Track lost on this frame",
+                                );
+                            }
+                            if self.tool_button(ui, Action::ClearTrack, "Clear pins") {
                                 fired = Some(Action::ClearTrack);
                             }
                         }
@@ -1213,9 +1651,10 @@ impl App {
                     .selected_text(match self.sort {
                         SortMode::Time => "sort: time",
                         SortMode::Sharpness => "sort: sharpness",
+                        SortMode::Coverage => "sort: coverage",
                     })
                     .show_ui(ui, |ui| {
-                        for m in [SortMode::Time, SortMode::Sharpness] {
+                        for m in [SortMode::Time, SortMode::Sharpness, SortMode::Coverage] {
                             if ui
                                 .selectable_label(self.sort == m, Action::SetSort(m).label())
                                 .clicked()
@@ -1260,6 +1699,24 @@ impl App {
                 culled,
                 self.bursts.len(),
             ));
+            let busy = self.engine.busy();
+            if busy > 0 {
+                ui.separator();
+                ui.spinner();
+                ui.label(format!("working… {busy}"));
+            }
+            if self.source == Source::Full {
+                ui.separator();
+                ui.label("source: full image");
+            }
+            if self.brighten {
+                ui.separator();
+                ui.label("brightened");
+            }
+            if self.peaking {
+                ui.separator();
+                ui.label("peaking");
+            }
 
             if self.scores.len() < self.scores_expected {
                 ui.separator();
@@ -1276,9 +1733,15 @@ impl App {
                 if let View::Burst { b, frame } = self.view {
                     if let Some(id) = self.current_id() {
                         let st = self.img_state(id);
-                        let score = match self.roi.get(&b).and_then(|t| t.roi_scores.get(&id)) {
-                            Some(rs) => format!("ROI {rs:.1}"),
-                            None => self
+                        let score = match self.roi.get(&b).map(|t| (t.eyes.get(&id), t.roi_scores.get(&id), t.done)) {
+                            Some((Some((kind, e)), _, true)) => format!(
+                                "eye {:.1} px · {:.0}% in focus ({})",
+                                e.width_px,
+                                100.0 * self.roi.get(&b).and_then(|t| t.coverage.get(&id)).copied().unwrap_or(0.0),
+                                if *kind == RoiKind::EyeCamera { "camera" } else { "tracked" }
+                            ),
+                            Some((_, Some(rs), _)) => format!("ROI {rs:.1}"),
+                            _ => self
                                 .scores
                                 .get(&id)
                                 .map(|s| format!("{s:.1}"))
@@ -1395,8 +1858,16 @@ impl App {
     }
 
     fn draw_overview(&mut self, ui: &mut egui::Ui) {
+        // Shift+wheel over the sheet resizes the thumbnails (0.5x-2x; the
+        // decoded thumbs are ~200 px, so larger would only blur).
+        if ui.rect_contains_pointer(ui.max_rect()) {
+            let (dx, dy, shift) = ui.input(|i| (i.raw_scroll_delta.x, i.raw_scroll_delta.y, i.modifiers.shift));
+            if shift && dx + dy != 0.0 {
+                self.thumb_scale = (self.thumb_scale * 1.1f32.powf((dx + dy) / 50.0)).clamp(0.5, 2.0);
+            }
+        }
         let cols = self.overview_cols(ui.ctx());
-        let cell = Vec2::new(168.0, 150.0);
+        let cell = Vec2::new(168.0, 150.0) * self.thumb_scale;
         let rows = self.bursts.len().div_ceil(cols);
         let cursor = self.overview_cursor;
         egui::ScrollArea::vertical()
@@ -1438,7 +1909,7 @@ impl App {
             .filter(|li| self.img_state(li.primary()).flag == Flag::Picked)
             .count();
 
-        let img_rect = Rect::from_min_size(rect.min + Vec2::new(4.0, 4.0), Vec2::new(160.0, 110.0));
+        let img_rect = Rect::from_min_size(rect.min + Vec2::new(4.0, 4.0), Vec2::new(160.0, 110.0) * self.thumb_scale);
         let painter = ui.painter();
         painter.rect_filled(img_rect, 4.0, Color32::from_gray(28));
         // stack effect for real bursts
@@ -1452,22 +1923,20 @@ impl App {
             );
         }
         if let Some(tid) = self.tex(JobKind::Thumb, cover_id, 50) {
+            let size = self.textures[&(JobKind::Thumb, cover_id)].handle.size_vec2();
             ui.painter().image(
                 tid,
-                img_rect,
+                fit_inside(size, img_rect),
                 Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
         }
         let painter = ui.painter();
-        // badges
-        painter.text(
-            img_rect.right_top() + Vec2::new(-4.0, 4.0),
-            Align2::RIGHT_TOP,
-            format!("{n}"),
-            FontId::proportional(13.0),
-            Color32::WHITE,
-        );
+        // Frame-count badge on a dark backing so it reads on pale thumbnails.
+        let galley = painter.layout_no_wrap(format!("{n}"), FontId::proportional(13.0), Color32::WHITE);
+        let text_rect = Align2::RIGHT_TOP.anchor_size(img_rect.right_top() + Vec2::new(-4.0, 4.0), galley.size());
+        painter.rect_filled(text_rect.expand2(Vec2::new(4.0, 2.0)), 3.0, Color32::from_black_alpha(190));
+        painter.galley(text_rect.min, galley, Color32::WHITE);
         let ring = if culled {
             Color32::from_rgb(80, 200, 90)
         } else if picks > 0 {
@@ -1516,31 +1985,28 @@ impl App {
         );
         ui.painter().rect_filled(main_rect, 0.0, Color32::from_gray(12));
 
-        let magnified = self.zoom_100 || self.inspect;
+        let magnified = self.zoom.is_some() || self.inspect;
+        let z = self.zoom.unwrap_or(1.0);
+        // Displayed (upright) pixel dimensions; the 1:1 view is sized from these
+        // so the preview stand-in lands where the full-res texture will.
+        let (dw, dh) = self.metas[id].display_dims();
+        let dims = Vec2::new(dw.max(1) as f32, dh.max(1) as f32);
         let full_tid = self.textures.get(&(JobKind::Full, id)).map(|t| t.handle.id());
-        let (tid, native) = if magnified {
+        let tid = if magnified {
             self.tex(JobKind::Full, id, 100);
-            let t = self
-                .textures
-                .get_mut(&(JobKind::Full, id))
-                .map(|t| {
-                    t.last_used = self.frame_no;
-                    (t.handle.id(), t.handle.size_vec2())
-                });
-            let dims = Vec2::new(
-                self.metas[id].width.max(1) as f32,
-                self.metas[id].height.max(1) as f32,
-            );
+            let t = self.textures.get_mut(&(JobKind::Full, id)).map(|t| {
+                t.last_used = self.frame_no;
+                t.handle.id()
+            });
             match t {
-                Some((tid, _)) => (Some(tid), dims),
-                None => (self.tex(JobKind::Preview, id, 90), dims),
+                Some(tid) => Some(tid),
+                None => self.tex(JobKind::Preview, id, 90),
             }
         } else {
-            let tid = match full_tid {
+            match full_tid {
                 Some(t) => Some(t),
                 None => self.tex(JobKind::Preview, id, 90),
-            };
-            (tid, Vec2::ZERO)
+            }
         };
 
         // What the 1:1 view centers on: the frame's tracked focus point in
@@ -1561,8 +2027,8 @@ impl App {
                 if main_resp.dragged() {
                     self.pan += main_resp.drag_delta();
                 }
-                // 1:1 pixels with the anchor at the viewport center + pan
-                let size = native;
+                // zoom x native pixels with the anchor at the viewport center + pan
+                let size = dims * z;
                 let min =
                     main_rect.center() - Vec2::new(anchor.x * size.x, anchor.y * size.y) + self.pan;
                 let img_rect = Rect::from_min_size(min.round(), size);
@@ -1580,12 +2046,12 @@ impl App {
                 };
                 let mode = if self.inspect {
                     if self.roi.get(&b).is_some_and(|t| t.points.contains_key(&id)) {
-                        "INSPECT focus point"
+                        format!("INSPECT focus point {:.0}%", z * 100.0)
                     } else {
-                        "INSPECT center (no track - click the subject)"
+                        format!("INSPECT center (no track - click the subject) {:.0}%", z * 100.0)
                     }
                 } else {
-                    "100%"
+                    format!("{:.0}%", z * 100.0)
                 };
                 ui.painter().text(
                     main_rect.left_top() + Vec2::new(8.0, 8.0),
@@ -1625,6 +2091,25 @@ impl App {
             );
         }
 
+        // Mouse wheel over the image: zoom about the cursor (a notch is x1.25);
+        // with Shift, resize the focus measuring area instead. Shift+wheel
+        // arrives as horizontal scroll on some platforms, so read both axes.
+        if let (Some(img_rect), Some(cursor)) = (display_rect, main_resp.hover_pos()) {
+            let (dx, dy, shift) = ui.input(|i| {
+                (i.raw_scroll_delta.x, i.raw_scroll_delta.y, i.modifiers.shift)
+            });
+            let scroll = if shift { dx + dy } else { dy };
+            if scroll != 0.0 {
+                let factor = 1.25f32.powf(scroll / 50.0);
+                if shift {
+                    let frac = self.roi_frac * factor;
+                    self.set_roi_frac(b, frac);
+                } else {
+                    self.wheel_zoom(cursor, img_rect, main_rect, dims, anchor, factor);
+                }
+            }
+        }
+
         // Click on the image = set the tracking point (e.g. the eye).
         if let (Some(img_rect), true) = (display_rect, main_resp.clicked()) {
             if let Some(pos) = main_resp.interact_pointer_pos() {
@@ -1636,6 +2121,11 @@ impl App {
             }
         }
 
+        // Right-click cancels this frame's manual override.
+        if main_resp.secondary_clicked() && self.is_pinned(b, id) {
+            self.unpin(b, id);
+        }
+
         // ROI overlay on the main image.
         if let Some((img_rect, &(x, y, conf))) = display_rect
             .zip(self.roi.get(&b).and_then(|t| t.points.get(&id)))
@@ -1644,7 +2134,8 @@ impl App {
                 img_rect.min.x + x * img_rect.width(),
                 img_rect.min.y + y * img_rect.height(),
             );
-            let side = (64.0 / 1620.0) * img_rect.width();
+            // The box is the focus measuring area (Shift+wheel resizes it).
+            let side = 2.0 * self.roi_frac * img_rect.width().max(img_rect.height());
             let color = if conf >= 0.75 {
                 Color32::from_rgb(80, 200, 90)
             } else if conf >= CONF_OK {
@@ -1652,12 +2143,41 @@ impl App {
             } else {
                 Color32::from_rgb(220, 70, 70)
             };
-            ui.painter().with_clip_rect(main_rect).rect_stroke(
-                Rect::from_center_size(center, Vec2::splat(side)),
-                2.0,
-                Stroke::new(2.0, color),
-                egui::StrokeKind::Outside,
-            );
+            let width = if self.is_pinned(b, id) { 3.5 } else { 2.0 };
+            match self.roi.get(&b).and_then(|t| t.eyes.get(&id)) {
+                // Measured pupil: the circle is the fitted pupil itself.
+                Some((_, eye)) => {
+                    let r = eye.r_frac * img_rect.width().max(img_rect.height());
+                    ui.painter().with_clip_rect(main_rect).circle_stroke(center, r, Stroke::new(width, color));
+                }
+                None => {
+                    ui.painter().with_clip_rect(main_rect).rect_stroke(
+                        Rect::from_center_size(center, Vec2::splat(side)),
+                        2.0,
+                        Stroke::new(width, color),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
+        }
+
+        // The camera's eye frame is always shown when present: dashed green
+        // while it is the focus point in use, dashed orange once a manual pin
+        // (or Use Camera Eye Points off) overrides it.
+        if let (Some(img_rect), Some(af)) = (display_rect, self.metas[id].af_box_eye()) {
+            let c = egui::pos2(img_rect.min.x + af.cx * img_rect.width(), img_rect.min.y + af.cy * img_rect.height());
+            let r = Rect::from_center_size(c, Vec2::new(af.w * img_rect.width(), af.h * img_rect.height()));
+            let overridden = self.is_pinned(b, id) || !self.use_af;
+            let color = if overridden { Color32::from_rgb(255, 140, 0) } else { Color32::from_rgb(80, 200, 90) };
+            let painter = ui.painter().with_clip_rect(main_rect);
+            for (p, q) in [
+                (r.left_top(), r.right_top()),
+                (r.right_top(), r.right_bottom()),
+                (r.right_bottom(), r.left_bottom()),
+                (r.left_bottom(), r.left_top()),
+            ] {
+                painter.extend(egui::Shape::dashed_line(&[p, q], Stroke::new(1.5, color), 6.0, 4.0));
+            }
         }
 
         // Filename, score and position now live in the status bar; only the
@@ -1696,8 +2216,7 @@ impl App {
                         let cell = Vec2::new(140.0, 118.0);
                         let (rect, resp) = ui.allocate_exact_size(cell, Sense::click());
                         if resp.clicked() {
-                            self.view = View::Burst { b, frame: pos };
-                            self.pan = Vec2::ZERO;
+                            self.goto_frame(b, pos);
                         }
                         if !ui.is_rect_visible(rect) {
                             continue;
@@ -1705,7 +2224,11 @@ impl App {
                         let img_rect =
                             Rect::from_min_size(rect.min + Vec2::new(2.0, 2.0), Vec2::new(136.0, 92.0));
                         ui.painter().rect_filled(img_rect, 3.0, Color32::from_gray(25));
+                        // Where the thumbnail actually lands (letterboxed when portrait).
+                        let mut shown = img_rect;
                         if let Some(tid) = self.tex(JobKind::Thumb, fid, 60) {
+                            let size = self.textures[&(JobKind::Thumb, fid)].handle.size_vec2();
+                            shown = fit_inside(size, img_rect);
                             let sst = self.img_state(fid);
                             let tint = if sst.flag == Flag::Rejected {
                                 Color32::from_gray(110)
@@ -1714,7 +2237,7 @@ impl App {
                             };
                             ui.painter().image(
                                 tid,
-                                img_rect,
+                                shown,
                                 Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                                 tint,
                             );
@@ -1724,8 +2247,8 @@ impl App {
                             self.roi.get(&b).and_then(|t| t.points.get(&fid))
                         {
                             let c = egui::pos2(
-                                img_rect.min.x + x * img_rect.width(),
-                                img_rect.min.y + y * img_rect.height(),
+                                shown.min.x + x * shown.width(),
+                                shown.min.y + y * shown.height(),
                             );
                             let color = if conf >= 0.75 {
                                 Color32::from_rgb(80, 200, 90)
@@ -1734,10 +2257,11 @@ impl App {
                             } else {
                                 Color32::from_rgb(220, 70, 70)
                             };
-                            ui.painter().with_clip_rect(img_rect).rect_stroke(
-                                Rect::from_center_size(c, Vec2::splat(7.0)),
+                            let side = (2.0 * self.roi_frac * shown.width().max(shown.height())).max(4.0);
+                            ui.painter().with_clip_rect(shown).rect_stroke(
+                                Rect::from_center_size(c, Vec2::splat(side)),
                                 1.0,
-                                Stroke::new(1.5, color),
+                                Stroke::new(if self.is_pinned(b, fid) { 3.0 } else { 1.5 }, color),
                                 egui::StrokeKind::Outside,
                             );
                         }
@@ -1753,9 +2277,13 @@ impl App {
                         };
                         ui.painter()
                             .rect_stroke(img_rect, 3.0, border, egui::StrokeKind::Outside);
-                        let s = match self.roi.get(&b).and_then(|t| t.roi_scores.get(&fid)) {
-                            Some(rs) => format!("•{rs:.1}"),
-                            None => self
+                        let s = match self.roi.get(&b).map(|t| (t.eyes.get(&fid), t.roi_scores.get(&fid), t.done)) {
+                            _ if self.sort == SortMode::Coverage && self.roi.get(&b).and_then(|t| t.coverage.get(&fid)).is_some() => {
+                                format!("{:.0}%", 100.0 * self.roi[&b].coverage[&fid])
+                            }
+                            Some((Some((_, e)), _, true)) => format!("{:.1}px", e.width_px),
+                            Some((_, Some(rs), _)) => format!("•{rs:.1}"),
+                            _ => self
                                 .scores
                                 .get(&fid)
                                 .map(|s| format!("{s:.1}"))
@@ -1832,10 +2360,15 @@ impl App {
                 let sharp = self.scores.get(&id).copied().unwrap_or(0.0);
                 let rank = rank0 + 1;
 
-                let basis = match (roi_s, conf) {
-                    (Some(_), Some(c)) if c >= CONF_OK => "sharpness at the tracked point",
-                    (_, Some(_)) => "overall sharpness (track lost here)",
-                    _ => "overall sharpness",
+                let eye_kind = track.filter(|t| t.done).and_then(|t| t.eyes.get(&id)).map(|(k, _)| *k);
+                let basis = match eye_kind {
+                    Some(RoiKind::EyeCamera) => "eye edge acuity (camera eye point)",
+                    Some(RoiKind::EyeTracked) => "eye edge acuity (tracked eye)",
+                    None => match (roi_s, conf) {
+                        (Some(_), Some(c)) if c >= CONF_OK => "sharpness at the tracked point",
+                        (_, Some(_)) => "overall sharpness (track lost here)",
+                        _ => "overall sharpness",
+                    },
                 };
                 let evidence = |verb: &str| {
                     format!("{verb}: rank {rank}/{burst_size} in burst {} by {basis}", b + 1)
@@ -1855,7 +2388,7 @@ impl App {
                 };
 
                 if st.flag == Flag::Picked {
-                    if self.harvest.do_xmp {
+                    if self.harvest.xmp_in_place {
                         actions.push(mk(
                             Op::WriteXmp {
                                 rating: st.rating.max(3),
@@ -1864,15 +2397,16 @@ impl App {
                         ));
                     }
                     if let Some(dest) = &dest {
+                        let rating = if self.harvest.xmp_with_copies { st.rating.max(3) } else { 0 };
                         actions.push(mk(
-                            Op::Copy { dest: dest.clone() },
+                            Op::Copy { dest: dest.clone(), rating },
                             evidence("picked"),
                         ));
                         // A paired JPEG travels with its RAW.
                         if let Some(j) = li.jpeg.filter(|&j| Some(j) != li.raw) {
                             actions.push(PlannedAction {
                                 file: self.rel_path(j),
-                                op: Op::Copy { dest: dest.clone() },
+                                op: Op::Copy { dest: dest.clone(), rating: 0 },
                                 enabled: true,
                                 burst: b + 1,
                                 burst_size,
@@ -1901,7 +2435,7 @@ impl App {
             settings: recipe::Settings {
                 top_n: AUTO_PICK_N,
                 gap_secs: 60,
-                write_xmp: self.harvest.do_xmp,
+                write_xmp: self.harvest.xmp_in_place,
                 copy_to: dest,
             },
             actions,
@@ -2030,7 +2564,6 @@ impl App {
         ui.label("Step 1 of 2 — build a recipe of the edits. Nothing is written yet.");
         ui.add_space(8.0);
 
-        ui.checkbox(&mut self.harvest.do_xmp, "Write XMP sidecars (rating)");
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.harvest.do_copy, "Copy picks to:");
             ui.text_edit_singleline(&mut self.harvest.dest);
@@ -2044,6 +2577,12 @@ impl App {
                 }
             }
         });
+        ui.checkbox(&mut self.harvest.xmp_with_copies, "Add XMP rating sidecars next to the copies");
+        ui.checkbox(
+            &mut self.harvest.xmp_in_place,
+            "Also write XMP sidecars next to the originals (touches the source folder)",
+        );
+        ui.weak("Originals are never moved, changed or deleted; flags, ratings and pins live in fd-session.json.");
 
         if !self.harvest.status.is_empty() {
             ui.add_space(4.0);
@@ -2052,7 +2591,7 @@ impl App {
 
         ui.add_space(8.0);
         let can_build = picks > 0
-            && (self.harvest.do_xmp || (self.harvest.do_copy && !self.harvest.dest.trim().is_empty()));
+            && (self.harvest.xmp_in_place || (self.harvest.do_copy && !self.harvest.dest.trim().is_empty()));
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(can_build, egui::Button::new("Build recipe"))
@@ -2302,21 +2841,44 @@ impl App {
             .show(ctx, |ui| {
                 ui.monospace(
                     "Overview   arrow keys move · Enter opens a burst\n\
-                     Burst      Left/Right frame · Up/Down burst · Esc back\n\
+                                 Shift+wheel resizes the thumbnails\n\
+                     Burst      Left/Right frame · Shift+Left/Right or Up/Down\n\
+                                previous/next burst (zoom kept) · Esc back\n\
                      Flags      P pick · X reject · U clear · 1-5 stars · 0 none\n\
+                                +/- one star more/less (stops at 5 and 0)\n\
                      Burst ops  Ctrl+Enter accept top 2 + reject rest\n\
                                 Ctrl+X reject all (asks first)\n\
-                     View       Z zoom 100% · I inspect (full-res JPEG locked\n\
+                     View       Z zoom 100% · mouse wheel zooms about the cursor\n\
+                                (drag to pan; the spot is kept while you flip\n\
+                                frames) · I inspect (full-res JPEG locked\n\
                                 onto the tracked focus point; Left/Right flips\n\
                                 frames with the eye pinned in place)\n\
-                                O sort time/sharpness\n\
+                                O sort time / sharpness / focus coverage\n\
+                                B auto-brighten dark images (display only)\n\
+                                K focus peaking: red = passes the focus test\n\
+                                Ctrl+Plus/Minus/0 UI size (auto-set from the screen)\n\
+                                View > Source: embedded preview or full image\n\
+                                (reopens the folder; flags are kept)\n\
                                 N next unculled burst · Ctrl+Z undo\n\
-                     Track      click the subject (e.g. the eye) — it is tracked\n\
-                                through the burst and frames re-rank by sharpness\n\
-                                there. The toolbar shows tracking confidence and\n\
-                                a button to clear it.\n\
-                     Harvest    Ctrl+H — builds a recipe of every intended edit,\n\
-                                which you review row by row before executing it.\n\
+                     Track      the camera's Eye-AF frame places the focus point on\n\
+                                every frame it detected (Burst > Use Camera Eye\n\
+                                Points); the pupil is measured at full resolution\n\
+                                and badges show its edge width in px (lower is\n\
+                                sharper). The camera's frame is the dashed box:\n\
+                                green while in use, orange when a pin overrides it.\n\
+                                Click the subject to pin a point when the camera\n\
+                                missed — right-click or Backspace unpins the frame\n\
+                                again. The pin is tracked through the burst;\n\
+                                click another frame to pin the point there too;\n\
+                                frames follow their nearest pin (thick box) and\n\
+                                re-rank by sharpness there. Shift+wheel resizes\n\
+                                the focus measuring area. The toolbar shows\n\
+                                tracking confidence and a button to clear it.\n\
+                     Harvest    Ctrl+H — builds a recipe (copy the picks to a\n\
+                                folder, XMP ratings next to the copies) that you\n\
+                                review row by row before executing it. Originals\n\
+                                are never moved, changed or deleted; flags, stars\n\
+                                and pins live in fd-session.json in the folder.\n\
                      Files      Ctrl+O open folder · Ctrl+S save session\n\
                                 Ctrl+Q quit\n\
                      Help       ? or H toggles this window",
@@ -2327,10 +2889,49 @@ impl App {
     }
 }
 
+/// Largest rect with `tex`'s aspect ratio centered in `cell`, so portrait
+/// thumbnails are letterboxed rather than squashed into the landscape cell.
+fn fit_inside(tex: Vec2, cell: Rect) -> Rect {
+    let scale = (cell.width() / tex.x.max(1.0)).min(cell.height() / tex.y.max(1.0));
+    Rect::from_center_size(cell.center(), tex * scale)
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let ctx = ctx.clone();
         self.frame_no += 1;
+        // UI scale follows the window's own pixel height (fresh every frame;
+        // egui's monitor size and maximized flag lag behind on X11): a
+        // 1080 px tall window is 1x, a maximized 4K window 2x, in quarter
+        // steps, applied only once the height has held steady for five
+        // frames so a resize drag does not make it jump. `--ui-zoom` fixes
+        // it; a manual Ctrl+Plus/Minus/0 takes over for the session.
+        // Some window managers ignore the maximize hint at creation or move
+        // the window to another monitor right after: keep asking during the
+        // first seconds until it is maximized, then leave it to the user.
+        if self.frame_no % 30 == 1
+            && self.scan_started.elapsed().as_secs_f32() < 5.0
+            && ctx.input(|i| i.viewport().maximized) != Some(true)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+        let est = ctx.input(|i| i.screen_rect().height() * i.pixels_per_point());
+        let (last, n) = self.zoom_est;
+        self.zoom_est = if (est - last).abs() < 0.02 * last { (last, n + 1) } else { (est, 0) };
+        let target = match self.ui_zoom {
+            Some(z) => (self.frame_no == 1).then_some(z),
+            None => (self.zoom_est.1 >= 5).then(|| ((self.zoom_est.0 / 1080.0) * 4.0).round() / 4.0).map(|z| z.clamp(1.0, 3.0)),
+        };
+        if let Some(z) = target {
+            let current = ctx.zoom_factor();
+            let user_changed = self.auto_zoom.is_some_and(|last| (current - last).abs() > 0.01);
+            if !user_changed && (z - current).abs() > 0.05 {
+                eprintln!("ui zoom {z:.2} (window {:.0} px tall)", self.zoom_est.0);
+                ctx.set_zoom_factor(z);
+                self.auto_zoom = Some(z);
+                self.zoom_est.1 = 0;
+            }
+        }
         self.drain_events(&ctx);
         if !self.harvest.open && self.confirm.is_none() && !self.show_about {
             self.handle_keys(&ctx);
@@ -2366,10 +2967,15 @@ impl eframe::App for App {
         self.draw_about(&ctx);
         self.draw_confirm(&ctx);
 
-        // keep streaming while background work exists
+        // Keep streaming while background work exists, and say so: the
+        // cursor is the busy indicator while anything decodes or tracks.
+        let busy = self.engine.busy() > 0 || !self.scan_done;
+        if busy {
+            ctx.set_cursor_icon(egui::CursorIcon::Progress);
+        }
         if self.engine.take_dirty() {
             ctx.request_repaint();
-        } else if self.engine.pending() > 0 || !self.scan_done {
+        } else if busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
 
@@ -2384,7 +2990,7 @@ impl eframe::App for App {
             for b in 0..self.bursts.len() {
                 self.accept_burst(b);
             }
-            self.harvest.do_xmp = true;
+            self.harvest.xmp_in_place = true;
             self.harvest.open = true;
             let r = self.build_recipe();
             self.enter_review(r);
@@ -2397,7 +3003,7 @@ impl eframe::App for App {
                 for b in 0..self.bursts.len() {
                     self.accept_burst(b);
                 }
-                self.harvest.do_xmp = true;
+                self.harvest.xmp_in_place = true;
                 let r = self.build_recipe();
                 match r.save(&out) {
                     Ok(()) => println!(
@@ -2467,15 +3073,27 @@ mod tests {
     /// Two bindings on the same key+modifier would both fire on one press.
     #[test]
     fn keymap_has_no_duplicate_bindings() {
-        let mut seen: Vec<(Key, bool)> = Vec::new();
-        for (key, ctrl, _) in KEYMAP {
-            let combo = (*key, *ctrl);
+        let mut seen: Vec<(Key, Mods)> = Vec::new();
+        for (key, mods, _) in KEYMAP {
+            let combo = (*key, *mods);
             assert!(
                 !seen.contains(&combo),
-                "duplicate binding for {key:?} (ctrl={ctrl})"
+                "duplicate binding for {key:?} ({mods:?})"
             );
             seen.push(combo);
         }
+    }
+
+    /// The session file is plain JSON and round-trips exactly.
+    #[test]
+    fn session_file_round_trips() {
+        let mut f = SessionFile { version: 1, ..Default::default() };
+        f.images.insert("a.JPG".into(), SessionImage { flag: "pick".into(), rating: 4 });
+        f.images.insert("b.JPG".into(), SessionImage { flag: "reject".into(), rating: 0 });
+        f.pins.insert("a.JPG".into(), (0.61, 0.34));
+        let json = serde_json::to_string_pretty(&f).unwrap();
+        assert!(json.contains("\"pick\"") && json.contains("\"rating\": 4"));
+        assert_eq!(serde_json::from_str::<SessionFile>(&json).unwrap(), f);
     }
 
     /// A bound action missing from ALL would escape the label check above.

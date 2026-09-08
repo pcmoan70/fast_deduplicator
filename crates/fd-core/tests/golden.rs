@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use fd_core::formats;
+use fd_core::formats::{self, Source};
 use fd_core::meta::{FileKind, Timestamp};
 
 fn fixture(name: &str) -> Option<PathBuf> {
@@ -59,13 +59,24 @@ fn cr3_r5m2_golden() {
     let th = m.thumb.expect("THMB");
     assert!(th.is_bare_jpeg && th.width == 160);
     // preview extracts to a valid JPEG stream
-    let (jpeg, w, h) = formats::extract_preview(&m).unwrap().expect("PRVW");
+    let (jpeg, w, h) = formats::extract_jpeg(&m, Source::Embedded).unwrap().expect("PRVW");
     assert_eq!((w, h), (1620, 1080));
     assert_eq!(&jpeg[0..2], &[0xFF, 0xD8]);
     // full-size embedded JPEG present with native dims
     let fs = m.fullsize.expect("fullsize trak");
     assert_eq!((fs.width, fs.height), (8192, 5464));
     assert!(fs.range.len > 1_000_000);
+    // the Full source hands out that trak sample as a bare JPEG stream
+    let (full, w, h) = formats::extract_jpeg(&m, Source::Full).unwrap().expect("trak jpeg");
+    assert_eq!(&full[0..2], &[0xFF, 0xD8]);
+    assert_eq!((w, h), (8192, 5464));
+    assert_eq!(full.len() as u64, fs.range.len);
+    // Canon MakerNote (CMT3): the eye-AF frame, 199x199 px at (+1969, +349)
+    let b = m.af_box.expect("AFInfo2");
+    assert!((b.cx - 0.7404).abs() < 1e-3 && (b.cy - 0.4361).abs() < 1e-3, "{b:?}");
+    assert!((b.w - 0.02429).abs() < 1e-4 && (b.h - 0.03642).abs() < 1e-4, "{b:?}");
+    assert_eq!(b.mode, 22);
+    assert!(m.af_box_eye().is_some());
 }
 
 #[test]
@@ -83,9 +94,25 @@ fn jpeg_r5m2_golden() {
     // Canon JPGs carry an MPF preview appendix; must beat whole-file decode
     let pv = m.preview.unwrap();
     assert!(pv.range.len < 1_000_000, "MPF preview not found");
-    let (jpeg, _, _) = formats::extract_preview(&m).unwrap().unwrap();
+    let (jpeg, _, _) = formats::extract_jpeg(&m, Source::Embedded).unwrap().unwrap();
     assert_eq!(&jpeg[0..2], &[0xFF, 0xD8]);
     assert_eq!(m.fullsize.unwrap().range.len, m.size);
+    // Full source = the file itself
+    let (full, w, h) = formats::extract_jpeg(&m, Source::Full).unwrap().unwrap();
+    assert_eq!(full.len() as u64, m.size);
+    assert_eq!((w, h), (8192, 5464));
+    // AF frame present but a 960x2134 zone, not an eye
+    assert!(m.af_box.is_some());
+    assert!(m.af_box_eye().is_none());
+    // lossless crop == the same window of the full decode (4:2:2 MCU = 16x8)
+    let (crop, x0, y0) = fd_core::decode::decode_luma_crop(&full, 1000, 700, 300, 200).unwrap();
+    assert_eq!((x0, y0), (992, 696));
+    let whole = fd_core::decode::decode_luma_scaled(&full, usize::MAX / 2).unwrap();
+    for row in 0..crop.height {
+        let a = &crop.pixels[row * crop.width..(row + 1) * crop.width];
+        let b = &whole.pixels[(y0 + row) * whole.width + x0..(y0 + row) * whole.width + x0 + crop.width];
+        assert_eq!(a, b, "row {row}");
+    }
 }
 
 #[test]
@@ -98,6 +125,11 @@ fn cr2_5d3_golden() {
     assert_eq!(m.kind, FileKind::Cr2);
     assert_eq!(m.model.as_deref(), Some("Canon EOS 5D Mark III"));
     assert!(m.ts.is_some());
-    let (jpeg, _, _) = formats::extract_preview(&m).unwrap().expect("IFD0 jpeg");
+    let (jpeg, _, _) = formats::extract_jpeg(&m, Source::Embedded).unwrap().expect("IFD0 jpeg");
     assert_eq!(&jpeg[0..2], &[0xFF, 0xD8]);
+    // CR2 has no full-size JPEG: Full falls back to the same IFD0 stream
+    let (full, _, _) = formats::extract_jpeg(&m, Source::Full).unwrap().expect("fallback");
+    assert_eq!(full, jpeg);
+    // DSLR AF point grid is not a subject frame
+    assert!(m.af_box.is_none());
 }

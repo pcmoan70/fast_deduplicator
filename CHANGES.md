@@ -1,5 +1,156 @@
 # Changes
 
+## 2026-09-08 — Docs pass
+- ARCHITECTURE: focus coverage / peaking bullet (one gradient test drives both
+  the `N% in focus` number and the red overlay) and a note that auto-brighten
+  and peaking are display-only engine flags that invalidate no cache.
+- In-app help: the tracking paragraph read out of order after the Shift+wheel
+  line was inserted; reflowed.
+- Verified `fd-gui --peaking --screenshot` on an 8-frame owl copy: overlay
+  drawn, chip shows `Eye (camera) · 5.1 px · 11% in focus`, status bar
+  `brightened | peaking`. 44 tests pass.
+
+## 2026-09-05 — Eye sharpness from the camera's eye point, busy cursor, HiDPI, auto-brighten
+- **Camera eye points.** The Eye-AF frame Canon writes into every JPG and CR3
+  (MakerNote AFInfo2) is parsed, so opening a burst places the focus point on
+  the eye of every frame the camera detected, with no click. Zone/body frames
+  are ignored by size. Verified on landscape and portrait (orientation 8)
+  frames.
+- **Pupil edge width replaces the patch score at the eye.** Around the focus
+  point the full-resolution JPEG is losslessly cropped, the pupil segmented,
+  and 64 rays across its rim give the 10-90% rise width in native px (75th
+  percentile; lower = sharper). Badges, chip, status and harvest evidence show
+  it (`eye 5.4 px (camera)`); `· motion` appears when the blur is directional.
+  Frames without a findable pupil, or whose pupil radius disagrees with the
+  burst, keep the patch score and rank below measured frames. On the 16-frame
+  owl burst the crispest frames by eye rank first and the softest last; on a
+  pale-eyed bird 9 of 12 pupils (r = 12 px) are found.
+- **When Eye-AF misses:** the camera's eye frame is always drawn as a dashed
+  box, green while in use and orange once overridden; a click pins the frame
+  and overrides the camera's box there; right-click, Backspace, the toolbar
+  `Unpin` button or Burst > Unpin This Frame cancel that frame's override;
+  `Clear Pins` returns the whole burst to the camera's points; *Burst > Use Camera
+  Eye Points* turns them off for bursts where the camera tracked the wrong
+  subject. Shift+wheel now sets the eye search area for frames without a box.
+- **Focus peaking** (`K`, View menu, `--peaking`): display-only overlay that
+  paints pixels whose smoothed luma gradient exceeds 8 levels/px red, on
+  previews and the 1:1 view. **Focus coverage**: the eye measurement now also
+  reports the fraction of the focus area (the camera's eye box, or the search
+  area) passing that same test, shown as `N% in focus`; *Sort by Focus
+  Coverage* is a third sort mode (`O` cycles through all three).
+- Shift+wheel over the contact sheet resizes the thumbnails (0.5x to 2x).
+- `+` / `-` step the star rating one at a time, stopping at 5 and 0 (no
+  wrap-around); also in Edit > Rating.
+- **Busy cursor** and `working… N` in the status bar while anything decodes or
+  measures; the tracking chip says `measuring…` until a burst's eyes are done.
+- **HiDPI.** The window starts maximized and the UI zoom follows the
+  window's pixel height in quarter steps (1080 px = 1x, a maximized 4K
+  window = 2x), applied only once the height has held steady so resizes do
+  not flicker; egui's monitor size and maximized flag were both found to lag
+  on X11 and are not used. Base type is 15% larger and buttons roomier;
+  Ctrl+Plus/Minus/0 adjust it; `--ui-zoom Z` fixes it.
+- **Auto-brighten** (on by default; `B` / View menu toggles it, `--no-brighten`
+  starts without): lifts dark frames for viewing only (linear gain so the
+  99.5th percentile reaches 235, capped at 4x; bright frames untouched),
+  applied in the decode worker; scores never see it.
+- **Non-destructive by construction.** The session is now `fd-session.json`
+  in the image folder (flags, stars and manual focus pins by file name; the
+  old hidden `.fd-session.tsv` is migrated on first save). Harvest defaults
+  to copying the picks to a `<folder>_keepers` sibling with an XMP rating
+  sidecar next to each copy; sidecars next to the originals are an opt-in
+  checkbox. Nothing is ever moved or deleted; the planned trash step is
+  dropped. `Op::Copy` carries an optional `rating` (old recipes still load).
+- Internals: `formats/canon.rs`, `eye.rs`, `decode::decode_luma_crop`,
+  `decode::orient_norm`, `FileMeta::af_box_eye`, `TrackRequest.use_af`,
+  `Event::EyePoint`/`TrackDone`, `Engine::busy`, `Engine::set_brighten`;
+  `sharpbench --eyes --out DIR` writes pupil crops with the fitted ring so
+  segmentation and ranking can be checked by eye. 41 tests.
+
+## 2026-09-04 — Sharper sharpness detector
+- The sharpness score is now contrast-normalized Laplacian energy (variance
+  of the 5-point Laplacian / luma variance, x100) instead of Sobel energy /
+  variance. Chosen with a new benchmark (`cargo run --release -p fd-core
+  --example sharpbench -- --point x,y <files>`, `--burst --seed NAME` for a
+  real sequence) that degrades real frames at native scale: a 2 px native blur
+  is now separated 2.0-3.6x (was 1.13-1.22x) at the same cost, sharp still
+  beats blurred under heavy common-mode noise, and the 16-frame owl burst's ROI
+  scores spread 3.55x instead of 1.10x, so the badges are no longer all
+  "2.7". Eye crops of the top- and bottom-ranked frames agree with the new
+  order. The global score gates tiles by contrast so a flat noisy area cannot
+  win max-over-tiles.
+- Scores are on a new scale (roughly 5-50 instead of 2-12) and cached under a
+  versioned key (`score::SCORE_VERSION`), so the first cull re-scores every
+  file (~20 s for 5,350 JPGs embedded, ~7 min with `--source full`); old rows
+  are orphaned, never mixed. On the test card the top-2 picks changed in 358
+  of 596 bursts, mostly bursts where the old scores were within 0.2 of each
+  other.
+- Measuring the tracked point at native resolution (lossless JPEG crop) was
+  benchmarked and not adopted: it did not improve discrimination relative to
+  jitter and inflated noise 3-10x while costing a decode per frame. The
+  benchmark stays in the repo so the next formula change is measured, not
+  guessed.
+- New unit tests: fine blur (0.5/1 px at working res) is separated in order
+  and by margin, common-mode noise does not invert ranking, exposure flicker
+  is invisible, flat noise scores low through `score_global`.
+
+## 2026-09-04 — Focus-point pins, Shift+arrows between bursts
+- **Pins.** Clicking the subject on any frame pins the focus point there;
+  clicking on another frame adds a second pin instead of restarting. Every
+  frame follows its nearest pin (ties go to the newest), so a drifted track is
+  fixed by pinning the frame where it went wrong. Pinned frames draw a thicker
+  box and the toolbar chip says `pinned`; Clear track removes all pins.
+  Internals: `TrackRequest.seeds` replaces the single seed; `run_track` runs
+  one wavefront per pin bounded by nearest-pin ownership.
+- **Shift+Left/Right** jump to the previous/next burst (same as Up/Down). The
+  key table now carries a modifier enum (`Mods::{None, Ctrl, Shift}`) instead
+  of a Ctrl flag.
+- Opening another burst keeps the zoom level and inspect mode (pan recenters),
+  so a zoomed comparison continues in the next sequence.
+
+## 2026-09-04 — Wheel zoom, adjustable focus area, zoom spot kept across frames
+- **Mouse wheel zooms** about the cursor (a notch is x1.25, up to 8x native);
+  zooming out past fit returns to fit. `Z` still toggles fit / 100%. The chip
+  shows the current percentage; inspect mode can be wheel-zoomed too.
+- **Shift+wheel resizes the focus measuring area** (the patch the ROI
+  sharpness is computed over). It is expressed as a fraction of the long
+  edge, so it means the same at preview and full-image resolution; the
+  toolbar shows it (`area 12%` by default = the old fixed 192 px patch on a
+  1620 px preview) and the burst is re-tracked and re-scored at the new size.
+  The green/amber/red box now shows this area rather than the 64 px tracker
+  template, on the main image and on the filmstrip.
+- In zoom (and inspect), moving to another frame of the same burst by arrow
+  key or filmstrip click keeps the current pan offset instead of recentering,
+  so every frame is viewed at the same spot. Entering a burst, Esc and
+  toggling zoom/inspect still reset it.
+- Internals: `TrackRequest.roi_frac`; `App.zoom: Option<f32>` replaces the
+  `zoom_100` flag.
+
+## 2026-09-04 — Image source option + upright display
+- **Image source.** `View > Source: Embedded Preview | Full Image` (also
+  `fd-gui DIR --source full` and `fd cull DIR --source full`). Embedded is the
+  previous behaviour (Canon JPG MPF preview, CR3 PRVW). Full uses the JPG
+  itself or a CR3's native-res embedded JPEG (CR2 falls back to its IFD0
+  preview), decoded at ~2000 px, so sharpness comes from the real pixels
+  rather than the camera's re-encoded preview. Governs the main preview,
+  scores and eye tracking; thumbnails stay embedded and 100%/inspect was
+  already full-size. Full-source scores are cached under their own key
+  (`-full` suffix); existing cache entries stay valid. Switching in the GUI
+  reopens the folder (flags survive; undo and the current view do not). The
+  status bar says `source: full image` while active; `fd cull` prints
+  `score[embedded|full]`.
+- **Upright display.** EXIF orientation is applied to thumbnails, previews,
+  full-res views and the tracking luma, so portrait shots (31% of the test
+  card) show portrait and click/track boxes land where you point. Thumbnails
+  are letterboxed in their cells instead of stretched. The global score is
+  still computed on the stored orientation (the metric is rotation-neutral
+  and old cache entries stay valid).
+- Internals: `formats::extract_preview` became `extract_jpeg(meta, Source)`;
+  `Engine::start` takes the source; the 100% zoom path now goes through the
+  same extraction (a CR3 without a JPEG trak previously fell back to decoding
+  the raw PRVW container). New tests: `orient` (all 8 EXIF cases + RGBA),
+  `display_dims`, cache key forms, and Full-source golden assertions for
+  JPG/CR3/CR2.
+
 ## 2026-08-03 — Inspect mode
 - New `I` shortcut (plus View menu and toolbar button): shows the
   full-resolution embedded JPEG at 1:1, auto-centered on the tracked focus

@@ -1,3 +1,4 @@
+pub mod canon;
 pub mod cr2;
 pub mod cr3;
 pub mod exif;
@@ -30,6 +31,29 @@ pub fn kind_from_ext(path: &Path) -> Option<FileKind> {
     }
 }
 
+/// Which embedded JPEG the main preview, sharpness scoring and tracking are
+/// computed from. Thumbnails always use the embedded preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Source {
+    /// The camera's embedded preview (Canon JPG: 1620px MPF appendix; CR3: PRVW).
+    #[default]
+    Embedded,
+    /// The full-size image (JPG: the file itself; CR3: the native-res embedded
+    /// JPEG). CR2 has none and falls back to its IFD0 preview.
+    Full,
+}
+
+impl std::str::FromStr for Source {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "embedded" => Ok(Source::Embedded),
+            "full" => Ok(Source::Full),
+            _ => Err(format!("expected embedded|full, got {s}")),
+        }
+    }
+}
+
 /// Stage-A header parse: open, read header chunk, extract metadata and
 /// preview byte ranges. Returns the meta plus bytes read (for benching).
 pub fn parse_header(path: &Path) -> Result<(FileMeta, u64), ParseError> {
@@ -57,10 +81,18 @@ pub fn parse_header(path: &Path) -> Result<(FileMeta, u64), ParseError> {
     Ok((meta, r.bytes_read))
 }
 
-/// Stage-B extraction: return the preview JPEG bytes for a meta (preview
-/// preferred, thumb fallback). Second value = pixel dims if known.
-pub fn extract_preview(meta: &FileMeta) -> Result<Option<(Vec<u8>, u32, u32)>, ParseError> {
-    let Some(info) = meta.preview.or(meta.thumb) else {
+/// Stage-B extraction: the JPEG bytes to work from. `Embedded` = preview
+/// (thumb fallback); `Full` = full-size JPEG, falling back to the preview
+/// where a format has none (CR2). Second value = pixel dims if known.
+pub fn extract_jpeg(
+    meta: &FileMeta,
+    source: Source,
+) -> Result<Option<(Vec<u8>, u32, u32)>, ParseError> {
+    let info = match source {
+        Source::Embedded => meta.preview.or(meta.thumb),
+        Source::Full => meta.fullsize.or(meta.preview).or(meta.thumb),
+    };
+    let Some(info) = info else {
         return Ok(None);
     };
     let mut r = FileReader::open(&meta.path)?;

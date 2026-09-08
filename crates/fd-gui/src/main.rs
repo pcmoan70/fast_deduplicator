@@ -2,6 +2,8 @@ mod app;
 
 use std::path::PathBuf;
 
+use fd_core::formats::Source;
+
 fn main() -> eframe::Result {
     let mut args = std::env::args().skip(1);
     let mut dir: Option<PathBuf> = None;
@@ -12,14 +14,28 @@ fn main() -> eframe::Result {
     let mut build_recipe: Option<PathBuf> = None;
     let mut open_harvest = false;
     let mut inspect = false;
+    let mut source = Source::default();
+    let mut brighten = true;
+    let mut peaking = false;
+    let mut ui_zoom: Option<f32> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--source" => {
+                source = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("--source: expected embedded|full");
+                    std::process::exit(2);
+                })
+            }
             "--screenshot" => screenshot = args.next().map(PathBuf::from),
             "--shot-frames" => {
                 shot_frames = args.next().and_then(|v| v.parse().ok()).unwrap_or(30)
             }
             "--open-burst" => open_burst = args.next().and_then(|v| v.parse().ok()),
             "--inspect" => inspect = true,
+            "--brighten" => brighten = true,
+            "--no-brighten" => brighten = false,
+            "--peaking" => peaking = true,
+            "--ui-zoom" => ui_zoom = args.next().and_then(|v| v.parse().ok()),
             "--build-recipe" => build_recipe = args.next().map(PathBuf::from),
             "--open-harvest" => open_harvest = true,
             "--auto-track" => {
@@ -33,15 +49,16 @@ fn main() -> eframe::Result {
     }
     let Some(dir) = dir else {
         eprintln!(
-            "usage: fd-gui <image-folder>\n\
+            "usage: fd-gui <image-folder> [--source embedded|full] [--no-brighten] [--peaking] [--ui-zoom Z]\n\
              self-test flags: --screenshot out.png --shot-frames N --open-burst N\n\
-             --auto-track x,y --build-recipe out.json"
+             --inspect --auto-track x,y --build-recipe out.json --open-harvest"
         );
         std::process::exit(2);
     };
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
+            .with_maximized(true)
             .with_inner_size([1600.0, 1000.0])
             .with_title("fast_deduplicator"),
         ..Default::default()
@@ -60,6 +77,10 @@ fn main() -> eframe::Result {
                 build_recipe,
                 open_harvest,
                 inspect,
+                source,
+                brighten,
+                peaking,
+                ui_zoom,
             )))
         }),
     )

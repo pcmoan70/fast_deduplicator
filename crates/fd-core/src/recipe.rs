@@ -46,8 +46,14 @@ pub struct Settings {
 pub enum Op {
     /// Write an XMP sidecar next to the original.
     WriteXmp { rating: u8 },
-    /// Copy the file (and any sidecar) into `dest`.
-    Copy { dest: PathBuf },
+    /// Copy the file (and any existing sidecar) into `dest`; with `rating`
+    /// above 0 an XMP sidecar is written next to the copy, never next to the
+    /// original.
+    Copy {
+        dest: PathBuf,
+        #[serde(default)]
+        rating: u8,
+    },
     /// Deliberately left alone. Present so the review shows what is being
     /// dropped, not only what is acted on.
     Skip,
@@ -82,7 +88,8 @@ impl PlannedAction {
     pub fn op_label(&self) -> String {
         match &self.op {
             Op::WriteXmp { rating } => format!("rate {rating}★"),
-            Op::Copy { dest } => format!("copy to {}", dest.display()),
+            Op::Copy { dest, rating: 0 } => format!("copy to {}", dest.display()),
+            Op::Copy { dest, rating } => format!("copy to {} + rate {rating}★", dest.display()),
             Op::Skip => "skip".into(),
         }
     }
@@ -181,7 +188,7 @@ pub fn check(recipe: &Recipe) -> Vec<Issue> {
                     });
                 }
             }
-            Op::Copy { dest } => {
+            Op::Copy { dest, .. } => {
                 if dest.exists() && !dest.is_dir() {
                     issues.push(Issue {
                         action: i,
@@ -295,18 +302,27 @@ pub fn execute(
                     report.sidecars += 1;
                 }
             }
-            Op::Copy { dest } => {
+            Op::Copy { dest, rating } => {
                 outcome.detail = format!("copy to {}", dest.display());
                 if !dry_run {
                     match output::copy_pick(&src, dest) {
                         Ok(p) => {
                             outcome.detail = format!("copied to {}", p.display());
                             report.copied += 1;
+                            if *rating > 0 {
+                                match output::write_sidecar(&p, *rating, None) {
+                                    Ok(_) => report.sidecars += 1,
+                                    Err(e) => outcome.error = Some(e.to_string()),
+                                }
+                            }
                         }
                         Err(e) => outcome.error = Some(e.to_string()),
                     }
                 } else {
                     report.copied += 1;
+                    if *rating > 0 {
+                        report.sidecars += 1;
+                    }
                 }
             }
             Op::Skip => unreachable!("skips are filtered above"),
@@ -359,13 +375,28 @@ mod tests {
         }
     }
 
+    /// The rating travels with the copy: the sidecar lands next to the copy
+    /// and the source folder stays untouched.
+    #[test]
+    fn copy_with_rating_writes_sidecar_in_destination_only() {
+        let dir = tmpdir("copyrate");
+        std::fs::write(dir.join("a.JPG"), b"jpeg").unwrap();
+        let dest = dir.join("keepers");
+        let r = recipe_in(&dir, vec![action("a.JPG", Op::Copy { dest: dest.clone(), rating: 4 })]);
+        let report = execute(&r, false, |_, _| {});
+        assert_eq!(report.failures().count(), 0);
+        assert!(dest.join("a.JPG").exists() && dest.join("a.xmp").exists());
+        assert!(!dir.join("a.xmp").exists(), "source folder must stay untouched");
+        assert_eq!((report.copied, report.sidecars), (1, 1));
+    }
+
     #[test]
     fn json_round_trips() {
         let r = recipe_in(
             Path::new("/cards/100EOSR5"),
             vec![
                 action("a.JPG", Op::WriteXmp { rating: 3 }),
-                action("b.JPG", Op::Copy { dest: PathBuf::from("/keepers") }),
+                action("b.JPG", Op::Copy { dest: PathBuf::from("/keepers"), rating: 0 }),
                 action("c.JPG", Op::Skip),
             ],
         );

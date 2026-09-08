@@ -3,12 +3,13 @@
 Super-fast culling tool for Canon EOS memory cards. Scans thousands of RAW
 files in seconds, groups burst sequences, ranks frames by sharpness at a
 point you click once (e.g. a bird's eye, tracked through the burst), and
-harvests the keepers: XMP ratings, copy picks, trash rejects.
+copies the keepers to a folder of your choice. Originals are never touched.
 
-*Updated: 2026-08-03 — status: M0–M3 done: format core, burst grouping +
+*Updated: 2026-09-08 — status: M0–M3 done: format core, burst grouping +
 sharpness ranking (CLI), GUI with full menu/toolbar control system,
-click-once eye tracking with ROI ranking, and a reviewable recipe harvest.
-Next: HEIF, trash-rejects, packaging (M4).*
+click-once eye tracking with ROI ranking, a reviewable recipe harvest, a
+selectable image source (embedded preview or full image) and upright display
+by EXIF orientation. Next: HEIF, packaging (M4).*
 
 ## GUI
 
@@ -22,20 +23,41 @@ Actions that do not apply right now are greyed rather than hidden. Below it a
 toolbar carries the frequent actions for the current view, and a status bar
 reports counts, scan/score progress and where you are.
 
-Card Overview shows every burst as a stack (green ring = culled). Enter opens a
-burst: filmstrip with sharpness badges, arrows navigate, `P`/`X` pick/reject
-with auto-advance, `1–5` stars, `Ctrl+Enter` accepts the top 2 and rejects the
+Card Overview shows every burst as a stack (green ring = culled; Shift+wheel
+resizes the thumbnails). Enter opens a
+burst: filmstrip with sharpness badges, Left/Right move between frames and
+Shift+Left/Right (or Up/Down) jump to the previous/next burst keeping the zoom
+level, `P`/`X` pick/reject
+with auto-advance, `1–5` stars (`+`/`-` step one star, stopping at 5 and 0), `Ctrl+Enter` accepts the top 2 and rejects the
 rest, `Ctrl+X` rejects the whole burst (asks first), `N` jumps to the next
-unculled burst, `Z` toggles 100% zoom (preview first, full-res swaps in).
-`Ctrl+Z` undoes. `?` shows all keys. Flags autosave to a session file;
-reopening the folder resumes where you left off.
+unculled burst, `Z` toggles 100% zoom (preview first, full-res swaps in). The
+mouse wheel zooms about the cursor, up to 8x; drag to pan. The spot you zoomed
+into is kept as you flip through the burst's frames, so neighbours are compared
+at the same place.
+`Ctrl+Z` undoes. `?` shows all keys. Flags, stars and focus pins autosave to
+`fd-session.json` in the folder (plain JSON, the only file the app writes
+there); reopening the folder resumes where you left off.
 
-**Click-and-track:** click the critical point (e.g. the bird's eye) on the main
-image. The point is tracked through the whole burst and every frame gets a box
-colored by tracking confidence (green/amber/red); the filmstrip re-ranks by
-sharpness *at that point*. The toolbar shows the current tracking confidence
-and a button to clear it. Re-click anywhere to move the track; frames where the
-track was lost rank last.
+**Eye sharpness:** the camera's Eye-AF frame (Canon MakerNote) is read from
+every file, so when you open a burst the focus point lands on the eye in each
+frame the camera detected, without a click. The pupil is then segmented at full
+resolution and the sharpness is the width of its edge in pixels (lower is
+sharper): a pupil rim 4 px wide is in focus, 9 px is not, and a directional
+smear is flagged as motion. Badges, the toolbar chip and the harvest evidence
+show that width. Frames where no pupil can be found keep the overall score and
+drop below the measured ones.
+
+**Helping the camera:** the camera's eye frame is always drawn as a dashed box,
+green while it is the focus point in use. When Eye-AF missed the point, click the
+right spot on that frame. That adds a pin: the pin (solid, thick, green)
+overrides the camera's box on its frame, which turns orange, and frames with no
+box follow their nearest pin by tracking. Right-click the image, press
+Backspace or use the toolbar's `Unpin` to cancel the override on that frame;
+`Clear Pins` cancels all of them. If the camera
+tracked the wrong subject through a whole burst, turn off *Burst > Use Camera
+Eye Points* and place pins yourself. Shift+wheel sets the search area used
+around a tracked point when there is no camera box. Frames where the track
+was lost rank last.
 
 **Inspect mode (`I`):** the full-resolution embedded JPEG at 1:1, automatically
 centered on the tracked focus point of *each* frame — flip through the burst
@@ -46,14 +68,50 @@ so — click the subject to get the real thing). Neighbour frames are pre-decode
 so flipping lands on full resolution, and drag still pans if you want to look
 around. `I` or `Z` leaves the mode.
 
+**Image source (View menu):** by default every file is browsed, scored and
+tracked from the camera's embedded preview (a Canon JPG's 1620 px MPF appendix,
+a CR3's PRVW). *View > Source: Full Image* works from the full image instead:
+the JPG itself, or a CR3's native-resolution embedded JPEG, decoded to ~2000 px,
+so sharpness comes from the real pixels rather than the camera's re-encoded
+preview. It is much slower, because every file is read in full. Scores from the
+two sources are cached separately and are not comparable with each other.
+Switching reopens the folder: flags are kept, undo history is not. The status
+bar says `source: full image` while it is active, and `fd-gui DIR --source full`
+starts that way. Thumbnails always come from the preview and 100% zoom always
+from the full image, whatever the setting.
+
+**Browsing aids:** `K` (View > Focus Peaking) paints every pixel that passes
+the focus test red, like the camera's MF peaking, on the preview and the 1:1
+view; the eye score "N% in focus" counts those pixels inside the focus area,
+and *Sort by Focus Coverage* (`O` cycles time / sharpness / coverage) ranks by
+it. Dark frames are lifted automatically for viewing (on by
+default; `B` or View > Auto-brighten Dark Images turns it off, `--no-brighten`
+starts without it). Frames that already reach the highlights are left alone,
+and scores never see it. The UI scales itself to the
+window (1080 px tall is 1x, a maximized 4K window is 2x) and Ctrl+Plus /
+Ctrl+Minus / Ctrl+0 adjust it.
+The cursor turns into the busy indicator and the status bar says `working…`
+while anything is decoding or measuring.
+
+Images are shown the right way up: the EXIF orientation is applied to
+thumbnails, previews, full-resolution views and the tracking coordinates, so a
+portrait shot is portrait everywhere and a click lands where you clicked.
+
 ## Harvest is two steps, and you check the middle one
+
+Nothing in this tool is destructive: originals are never moved, changed or
+deleted, and a reject is only a flag in `fd-session.json`. Harvest copies the
+picked images (RAW plus paired JPEG) to a folder of your choice, by default a
+`<folder>_keepers` sibling, with an XMP rating sidecar next to each copy so
+Lightroom or darktable pick the stars up there. Writing sidecars next to the
+originals is an opt-in checkbox.
 
 `Ctrl+H` does not write anything. It builds a **recipe** — a JSON list of every
 intended edit — and shows it as a table you read before committing:
 
 | run | file | operation | burst | rank | sharp | track | why / status |
 |---|---|---|---|---|---|---|---|
-| ☑ | 4P4A1413.JPG | rate 3★ | 1 | 1/6 | 10.6 | 0.82 | picked: rank 1/6 in burst 1 by sharpness at the tracked point |
+| ☑ | 4P4A1413.JPG | copy to …_keepers + rate 3★ | 1 | 1/6 | 10.6 | 0.82 | picked: rank 1/6 in burst 1 by eye edge acuity (camera eye point) |
 | ☐ | 4P4A1410.JPG | skip | 1 | 3/6 | 9.9 | — | rejected: rank 3/6 in burst 1 by overall sharpness |
 
 Every row carries the evidence behind the decision, so you can confirm the
@@ -90,6 +148,10 @@ Measured on a real EOS R5 Mark II card dump (5,540 files, 103 GB):
 
 CR3 (incl. C-RAW), CR2, JPEG — parsed with bespoke minimal readers.
 HEIF (.HIF) planned (M4). Dual Pixel RAW tolerated (previews unaffected).
+The *Full Image* source uses the JPG file itself or a CR3's native-resolution
+embedded JPEG; CR2 has none and falls back to its IFD0 preview. EXIF orientation
+is read from all three and applied on display, and the Eye-AF frame is read
+from Canon's MakerNote (AFInfo2) in JPG and CR3.
 
 ## Usage (CLI, current state)
 
@@ -102,6 +164,7 @@ fd scan DIR --dump-fullsize OUT  # extract full-res embedded JPEGs
 fd cull DIR --dry-run            # group bursts, rank by sharpness, list picks
 fd cull DIR --top 2 --xmp        # write XMP sidecars (rating 3) for top 2/burst
 fd cull DIR --copy-to KEEPERS    # copy picks (+sidecars) to a folder
+fd cull DIR --source full        # score from the full image, not the preview
 
 fd apply RECIPE.json --dry-run   # step 2 of harvest: report, write nothing
 fd apply RECIPE.json --verbose   # ...and do it, one line per action
@@ -109,10 +172,16 @@ fd apply RECIPE.json --verbose   # ...and do it, one line per action
 fd bench FILE                    # per-stage timings for one file
 ```
 
-Measured on the reference card (5,540 files): cold cull 13.6 s, re-cull
-with warm cache 0.17 s. RAW+JPEG pairs are treated as one image. Canon
+Measured on the reference card (5,540 files): cold cull ~20 s, re-cull
+with warm cache 0.2 s. RAW+JPEG pairs are treated as one image. Sharpness is
+contrast-normalized Laplacian energy at the working resolution, chosen by a
+benchmark on real frames (see ARCHITECTURE.md); scores only mean something
+relative to each other within a burst. Canon
 JPGs are scored from their embedded 1620px MPF preview (~300 KB read
-instead of a 45 MP decode).
+instead of a 45 MP decode). `--source full` reads and entropy-decodes the whole
+file instead (1/4 DCT scale, 2048 px) and keeps its scores under separate cache
+keys, so the two modes never mix: cold full-source cull of the same card took
+6 min 51 s (5,350 JPGs, ~95 GB read); re-cull with warm cache 0.2 s.
 
 ## Installing and running
 

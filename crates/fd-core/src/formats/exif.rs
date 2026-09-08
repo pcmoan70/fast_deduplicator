@@ -19,6 +19,7 @@ pub const TAG_PIXEL_X: u16 = 0xA002;
 pub const TAG_PIXEL_Y: u16 = 0xA003;
 pub const TAG_BODY_SERIAL: u16 = 0xA431;
 pub const TAG_LENS_MODEL: u16 = 0xA434;
+pub const TAG_MAKER_NOTE: u16 = 0x927C;
 
 /// Read IFD0 tags (make/model/orientation) and, if present, descend into the
 /// Exif IFD. Returns the Exif IFD offset if the caller wants more.
@@ -80,6 +81,14 @@ fn apply_exif_ifd_at(t: &Tiff, offset: u32, meta: &mut FileMeta) {
             }
             TAG_BODY_SERIAL => meta.serial = t.ascii(e),
             TAG_LENS_MODEL => meta.lens = t.ascii(e),
+            // Canon's MakerNote is a bare IFD whose offsets share this TIFF.
+            TAG_MAKER_NOTE => {
+                if meta.make.as_deref().is_some_and(|m| m.starts_with("Canon")) {
+                    if let Some(off) = t.value_offset(e) {
+                        super::canon::apply_makernote(t, off, meta);
+                    }
+                }
+            }
             _ => {}
         }
     }
